@@ -28,6 +28,7 @@ const TEST_CONFIG = {
   slackInitialThreadHistoryCount: 8,
   slackHistoryApiMaxLimit: 50,
   slackActiveTurnReconcileIntervalMs: 15_000,
+  slackActiveTurnStallTimeoutMs: 10 * 60_000,
   slackMissedThreadRecoveryIntervalMs: 15_000,
   adminBaseUrl: "https://admin.example"
 } as AppConfig;

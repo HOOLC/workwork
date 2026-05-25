@@ -40,6 +40,12 @@ export async function handleSlackRequest(
     return true;
   }
 
+  const matchedRepairActiveTurn = matchRepairActiveTurnPath(url.pathname);
+  if (method === "POST" && matchedRepairActiveTurn) {
+    await handleSlackRepairActiveTurnRequest(response, options, matchedRepairActiveTurn.sessionKey);
+    return true;
+  }
+
   const matchedResetSession = matchResetSessionPath(url.pathname);
   if (method === "POST" && matchedResetSession) {
     await handleSlackResetSessionRequest(response, options, matchedResetSession.sessionKey);
@@ -103,6 +109,28 @@ async function handleSlackResumePendingSessionRequest(
       ok: true,
       sessionKey,
       resumedCount
+    });
+  } catch (error) {
+    respondJson(response, 500, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+async function handleSlackRepairActiveTurnRequest(
+  response: http.ServerResponse,
+  options: {
+    readonly bridge: SlackAgentBridge;
+  },
+  sessionKey: string
+): Promise<void> {
+  try {
+    const repair = await options.bridge.repairActiveTurn(sessionKey);
+    respondJson(response, 200, {
+      ok: true,
+      sessionKey,
+      repair
     });
   } catch (error) {
     respondJson(response, 500, {
@@ -680,6 +708,23 @@ function normalizeStringArray(value: unknown): string[] | undefined {
 function matchResumeSessionPath(pathname: string): { readonly sessionKey: string } | null {
   const prefix = "/slack/sessions/";
   const suffix = "/resume-pending";
+  if (!pathname.startsWith(prefix) || !pathname.endsWith(suffix)) {
+    return null;
+  }
+
+  const encodedKey = pathname.slice(prefix.length, -suffix.length);
+  if (!encodedKey) {
+    return null;
+  }
+
+  return {
+    sessionKey: decodeURIComponent(encodedKey)
+  };
+}
+
+function matchRepairActiveTurnPath(pathname: string): { readonly sessionKey: string } | null {
+  const prefix = "/slack/sessions/";
+  const suffix = "/repair-active-turn";
   if (!pathname.startsWith(prefix) || !pathname.endsWith(suffix)) {
     return null;
   }

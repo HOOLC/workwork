@@ -47,6 +47,45 @@ function createResponse() {
 }
 
 describe("handleSlackRequest", () => {
+  it("routes internal active-turn repair requests through the bridge", async () => {
+    const repairActiveTurn = vi.fn(async () => ({
+      repaired: true,
+      previousActiveTurnId: "turn-1",
+      resetInflightCount: 2,
+      resumedCount: 2,
+      interruptedActiveTurn: true
+    }));
+    const response = createResponse();
+
+    const handled = await handleSlackRequest(
+      "POST",
+      new URL(`http://localhost/slack/sessions/${encodeURIComponent("C123:111.222")}/repair-active-turn`),
+      createJsonRequest({}) as never,
+      response as never,
+      {
+        bridge: {
+          repairActiveTurn
+        } as never,
+        config: {} as never
+      }
+    );
+
+    expect(handled).toBe(true);
+    expect(repairActiveTurn).toHaveBeenCalledWith("C123:111.222");
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.bodyText || "{}")).toMatchObject({
+      ok: true,
+      sessionKey: "C123:111.222",
+      repair: {
+        repaired: true,
+        previousActiveTurnId: "turn-1",
+        resetInflightCount: 2,
+        resumedCount: 2,
+        interruptedActiveTurn: true
+      }
+    });
+  });
+
   it("routes internal session delete requests through the bridge", async () => {
     const deleteSession = vi.fn(async () => ({
       deleted: true,

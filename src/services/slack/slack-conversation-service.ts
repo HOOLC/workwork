@@ -150,7 +150,8 @@ export class SlackConversationService {
     this.#turnReconciler = new SlackTurnReconciler({
       sessions: this.#sessions,
       turnRunner: this.#turnRunner,
-      inboundStore: this.#inboundStore
+      inboundStore: this.#inboundStore,
+      activeTurnStallTimeoutMs: this.#config.slackActiveTurnStallTimeoutMs
     });
     this.#agentRuntimeEventHandler = (event) => {
       this.#handleAgentRuntimeEvent(event);
@@ -310,6 +311,75 @@ export class SlackConversationService {
     return await this.#resumePendingDispatch(sessionKey, {
       forceReset: true
     });
+  }
+
+  async repairActiveTurn(sessionKey: string): Promise<{
+    readonly repaired: boolean;
+    readonly previousActiveTurnId: string | null;
+    readonly resetInflightCount: number;
+    readonly resumedCount: number;
+    readonly interruptedActiveTurn: boolean;
+    readonly interruptError?: string | undefined;
+    readonly authBlocked: boolean;
+  }> {
+    const session = this.#findSessionByKey(sessionKey);
+    const previousActiveTurnId = session.activeTurnId ?? null;
+    const authBlocked = Boolean(session.authBlockedAt);
+
+    if (!session.activeTurnId) {
+      const resumedCount = authBlocked
+        ? 0
+        : await this.#resumePendingDispatch(session.key, {
+            forceReset: true
+          });
+      return {
+        repaired: false,
+        previousActiveTurnId,
+        resetInflightCount: 0,
+        resumedCount,
+        interruptedActiveTurn: false,
+        authBlocked
+      };
+    }
+
+    const activeTurnId = session.activeTurnId;
+    const resetInflightCount = await this.#inboundStore.resetTurnBatchToPending(session, activeTurnId);
+    await this.#sessions.setActiveTurnId(session.channelId, session.rootThreadTs, undefined);
+    this.#resetRuntimeProcessing(session.key);
+    this.#clearAssistantStatus(session.channelId, session.rootThreadTs);
+
+    let interruptedActiveTurn = false;
+    let interruptError: string | undefined;
+    if (session.agentSessionId) {
+      try {
+        await this.#turnRunner.interrupt(session);
+        interruptedActiveTurn = true;
+      } catch (error) {
+        interruptError = error instanceof Error ? error.message : String(error);
+        logger.warn("Failed to interrupt active turn during manual active-turn repair", {
+          sessionKey: session.key,
+          agentSessionId: session.agentSessionId,
+          turnId: activeTurnId,
+          error: interruptError
+        });
+      }
+    }
+
+    const resumedCount = authBlocked
+      ? 0
+      : await this.#resumePendingDispatch(session.key, {
+          forceReset: true
+        });
+
+    return {
+      repaired: true,
+      previousActiveTurnId,
+      resetInflightCount,
+      resumedCount,
+      interruptedActiveTurn,
+      authBlocked,
+      ...(interruptError ? { interruptError } : {})
+    };
   }
 
   async resetSession(sessionKey: string): Promise<{

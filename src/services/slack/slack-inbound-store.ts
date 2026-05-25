@@ -225,8 +225,9 @@ export class SlackInboundStore {
     return session;
   }
 
-  async resetTurnBatchToPending(session: SlackSessionRecord, turnId: string): Promise<void> {
-    await this.#sessions.resetInflightMessages(session.channelId, session.rootThreadTs, turnId);
+  async resetTurnBatchToPending(session: SlackSessionRecord, turnId: string): Promise<number> {
+    const resetMessages = await this.#sessions.resetInflightMessages(session.channelId, session.rootThreadTs, turnId);
+    return resetMessages.length;
   }
 
   async reconcileOrphanedInflightMessages(session: SlackSessionRecord): Promise<{

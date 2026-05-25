@@ -119,13 +119,7 @@ export class SlackTurnRunner {
           aborted: result.aborted,
           attempt: attempt + 1
         });
-        await this.#persistTurnUsage(session, result);
-        session = await this.#inboundStore.markTurnBatchDone(session, submitted.receipt.turnId);
-        session = await this.#sessions.clearActiveTurnIdIfMatches(
-          session.channelId,
-          session.rootThreadTs,
-          submitted.receipt.turnId
-        );
+        session = await this.#finalizeCompletedTurnIfStillActive(session, submitted.receipt.turnId, result);
         return {
           session,
           result
@@ -140,13 +134,7 @@ export class SlackTurnRunner {
             turnId: submitted.receipt.turnId,
             recoveredStatus: recovered.aborted ? "interrupted" : "completed"
           });
-          await this.#persistTurnUsage(session, recovered);
-          session = await this.#inboundStore.markTurnBatchDone(session, submitted.receipt.turnId);
-          session = await this.#sessions.clearActiveTurnIdIfMatches(
-            session.channelId,
-            session.rootThreadTs,
-            submitted.receipt.turnId
-          );
+          session = await this.#finalizeCompletedTurnIfStillActive(session, submitted.receipt.turnId, recovered);
           return {
             session,
             result: recovered
@@ -190,6 +178,32 @@ export class SlackTurnRunner {
     }
   ) {
     return await this.#agentRuntime.readTurn(session, turnId, options);
+  }
+
+  async #finalizeCompletedTurnIfStillActive(
+    session: SlackSessionRecord,
+    turnId: string,
+    result: AgentTurnResult
+  ): Promise<SlackSessionRecord> {
+    const latestSession = this.#sessions.getSession(session.channelId, session.rootThreadTs) ?? session;
+    await this.#persistTurnUsage(latestSession, result);
+
+    if (latestSession.activeTurnId !== turnId) {
+      logger.warn("Skipping stale agent turn completion finalization because broker active turn changed", {
+        sessionKey: session.key,
+        turnId,
+        currentActiveTurnId: latestSession.activeTurnId ?? null
+      });
+      return latestSession;
+    }
+
+    let finalizedSession = await this.#inboundStore.markTurnBatchDone(latestSession, turnId);
+    finalizedSession = await this.#sessions.clearActiveTurnIdIfMatches(
+      finalizedSession.channelId,
+      finalizedSession.rootThreadTs,
+      turnId
+    );
+    return finalizedSession;
   }
 
   async ensureAgentSession(session: SlackSessionRecord): Promise<SlackSessionRecord> {

@@ -842,6 +842,84 @@ describe.sequential("slack-codex-broker e2e", () => {
     expect(finalInbound.filter((message) => message.status !== "done")).toHaveLength(0);
   }, 90_000);
 
+  it("recovers a silent in-progress active turn after the stall timeout", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "slack-codex-broker-e2e-"));
+    cleanups.push(async () => {
+      await removeTempRoot(tempRoot);
+    });
+
+    let turnStartCount = 0;
+    let releaseFirstTurn: (() => void) | undefined;
+    const firstTurnGate = new Promise<void>((resolve) => {
+      releaseFirstTurn = resolve;
+    });
+    const mockSlack = new MockSlackServer("UBOT", {
+      botId: "BBOT",
+      appId: "AAPP"
+    });
+    const mockCodex = new MockCodexAppServer({
+      onTurnStart: async (context) => {
+        turnStartCount += 1;
+        if (turnStartCount === 1) {
+          await firstTurnGate;
+          return;
+        }
+
+        context.complete("RECOVERED_AFTER_STALE_ACTIVE_TURN");
+      }
+    });
+    const slackPort = await mockSlack.start();
+    const codexUrl = await mockCodex.start();
+    cleanups.push(async () => {
+      releaseFirstTurn?.();
+      await mockCodex.stop();
+      await mockSlack.stop();
+    });
+
+    const sessionKey = "C123:224.220";
+    const broker = await startBrokerProcess({
+      port: await getFreePort(),
+      slackPort,
+      codexUrl,
+      tempRoot,
+      extraEnv: {
+        SLACK_ACTIVE_TURN_RECONCILE_INTERVAL_MS: "100",
+        SLACK_ACTIVE_TURN_STALL_TIMEOUT_MS: "300",
+        SLACK_MISSED_THREAD_RECOVERY_INTERVAL_MS: "100"
+      }
+    });
+    cleanups.push(() => broker.stop());
+
+    await mockSlack.sendEvent("evt-stale-active-turn-session", {
+      type: "app_mention",
+      user: "U123",
+      channel: "C123",
+      thread_ts: "224.220",
+      ts: "224.221",
+      text: "<@UBOT> START_STALE_ACTIVE_TURN"
+    });
+
+    await waitFor(() => mockCodex.turnsStarted.length >= 1, "initial stale active turn");
+    await waitForSessionActive(tempRoot, sessionKey);
+    await waitFor(() => mockCodex.interrupts.length >= 1, "stale active turn interrupt", 60_000);
+    await waitFor(() => mockCodex.turnsStarted.length >= 2, "replacement turn after stale active recovery", 60_000);
+    await waitFor(() => mockCodex.turnsStarted[1]?.status === "completed", "replacement turn completion", 60_000);
+    await waitFor(async () => {
+      const session = await readSessionRecord(tempRoot, sessionKey);
+      return !session.activeTurnId && session.lastDeliveredMessageTs === "224.221";
+    }, "stale active recovery delivery cursor", 60_000);
+
+    const replacementTurnText = collectTextInput(mockCodex.turnsStarted[1]!.input);
+    expect(replacementTurnText).toContain("START_STALE_ACTIVE_TURN");
+
+    const finalSession = await readSessionRecord(tempRoot, sessionKey);
+    expect(finalSession.activeTurnId).toBeUndefined();
+    expect(finalSession.lastDeliveredMessageTs).toBe("224.221");
+
+    const finalInbound = await readInboundMessages(tempRoot, sessionKey);
+    expect(finalInbound.filter((message) => message.status !== "done")).toHaveLength(0);
+  }, 90_000);
+
   it("periodically recovers missed thread replies without requiring a socket reconnect", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "slack-codex-broker-e2e-"));
     cleanups.push(async () => {

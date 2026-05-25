@@ -26,6 +26,7 @@ describe("loadConfig", () => {
     expect(config.slackInitialThreadHistoryCount).toBe(8);
     expect(config.slackHistoryApiMaxLimit).toBe(50);
     expect(config.slackActiveTurnReconcileIntervalMs).toBe(15_000);
+    expect(config.slackActiveTurnStallTimeoutMs).toBe(10 * 60_000);
     expect(config.slackMissedThreadRecoveryIntervalMs).toBe(5 * 60_000);
     expect(config.logLevel).toBe("info");
     expect(config.logRawSlackEvents).toBe(true);
@@ -64,6 +65,16 @@ describe("loadConfig", () => {
         PORT: "nope"
       } as NodeJS.ProcessEnv)
     ).toThrowError("Invalid numeric environment variable: PORT");
+  });
+
+  it("loads an explicit active turn stall timeout", () => {
+    const config = loadConfig({
+      SLACK_APP_TOKEN: "xapp-test",
+      SLACK_BOT_TOKEN: "xoxb-test",
+      SLACK_ACTIVE_TURN_STALL_TIMEOUT_MS: "12345"
+    } as NodeJS.ProcessEnv);
+
+    expect(config.slackActiveTurnStallTimeoutMs).toBe(12345);
   });
 
 

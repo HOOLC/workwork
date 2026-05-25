@@ -47,6 +47,7 @@ Copy `.env.example` to `.env` and fill in:
 - `SLACK_BOT_TOKEN`
 - optional `SLACK_INITIAL_THREAD_HISTORY_COUNT`
 - optional `SLACK_HISTORY_API_MAX_LIMIT`
+- optional `SLACK_ACTIVE_TURN_STALL_TIMEOUT_MS` (defaults to 10 minutes)
 - optional `SESSIONS_ROOT`
 - optional `REPOS_ROOT`
 - optional `LOG_DIR`

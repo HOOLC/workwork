@@ -9,6 +9,7 @@ export interface AppConfig {
   readonly slackInitialThreadHistoryCount: number;
   readonly slackHistoryApiMaxLimit: number;
   readonly slackActiveTurnReconcileIntervalMs: number;
+  readonly slackActiveTurnStallTimeoutMs: number;
   readonly slackMissedThreadRecoveryIntervalMs: number;
   readonly stateDir: string;
   readonly jobsRoot: string;
@@ -188,6 +189,7 @@ export function loadConfig(env = process.env): AppConfig {
     slackInitialThreadHistoryCount: getNumber(env, "SLACK_INITIAL_THREAD_HISTORY_COUNT", 8),
     slackHistoryApiMaxLimit: getNumber(env, "SLACK_HISTORY_API_MAX_LIMIT", 50),
     slackActiveTurnReconcileIntervalMs: getNumber(env, "SLACK_ACTIVE_TURN_RECONCILE_INTERVAL_MS", 15_000),
+    slackActiveTurnStallTimeoutMs: getNumber(env, "SLACK_ACTIVE_TURN_STALL_TIMEOUT_MS", 10 * 60_000),
     slackMissedThreadRecoveryIntervalMs: getNumber(
       env,
       "SLACK_MISSED_THREAD_RECOVERY_INTERVAL_MS",

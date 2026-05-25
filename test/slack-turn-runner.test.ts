@@ -136,6 +136,7 @@ describe("SlackTurnRunner", () => {
         downloadFileAttachment: vi.fn()
       } as never,
       sessions: {
+        getSession: vi.fn(() => activeSession),
         setActiveTurnId: vi.fn(async (_channelId: string, _rootThreadTs: string, turnId: string | undefined) => {
           calls.push(turnId ? "set-active" : "clear-active");
           return turnId ? activeSession : session;

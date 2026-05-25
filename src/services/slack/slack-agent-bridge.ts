@@ -143,6 +143,10 @@ export class SlackAgentBridge {
     return await this.#conversations.resumePendingSession(sessionKey);
   }
 
+  async repairActiveTurn(sessionKey: string) {
+    return await this.#conversations.repairActiveTurn(sessionKey);
+  }
+
   async resetSession(sessionKey: string) {
     return await this.#conversations.resetSession(sessionKey);
   }
