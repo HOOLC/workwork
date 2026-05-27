@@ -10,6 +10,7 @@ export interface AppConfig {
   readonly slackHistoryApiMaxLimit: number;
   readonly slackActiveTurnReconcileIntervalMs: number;
   readonly slackMissedThreadRecoveryIntervalMs: number;
+  readonly slackStaleActiveTurnAfterMs: number;
   readonly stateDir: string;
   readonly jobsRoot: string;
   readonly sessionsRoot: string;
@@ -193,6 +194,7 @@ export function loadConfig(env = process.env): AppConfig {
       "SLACK_MISSED_THREAD_RECOVERY_INTERVAL_MS",
       5 * 60_000
     ),
+    slackStaleActiveTurnAfterMs: getNumber(env, "SLACK_STALE_ACTIVE_TURN_AFTER_MS", 30 * 60_000),
     stateDir,
     jobsRoot,
     sessionsRoot,

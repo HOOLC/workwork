@@ -27,6 +27,7 @@ describe("loadConfig", () => {
     expect(config.slackHistoryApiMaxLimit).toBe(50);
     expect(config.slackActiveTurnReconcileIntervalMs).toBe(15_000);
     expect(config.slackMissedThreadRecoveryIntervalMs).toBe(5 * 60_000);
+    expect(config.slackStaleActiveTurnAfterMs).toBe(30 * 60_000);
     expect(config.logLevel).toBe("info");
     expect(config.logRawSlackEvents).toBe(true);
     expect(config.logRawCodexRpc).toBe(true);
@@ -167,6 +168,16 @@ describe("loadConfig", () => {
     expect(config.githubOAuthScopes).toEqual(["repo", "read:user", "workflow"]);
     expect(config.defaultGitHubLogin).toBe("default-bot");
     expect(config.defaultGitHubToken).toBe("default-token");
+  });
+
+  it("loads an explicit stale active turn watchdog threshold", () => {
+    const config = loadConfig({
+      SLACK_APP_TOKEN: "xapp-test",
+      SLACK_BOT_TOKEN: "xoxb-test",
+      SLACK_STALE_ACTIVE_TURN_AFTER_MS: "600000"
+    } as NodeJS.ProcessEnv);
+
+    expect(config.slackStaleActiveTurnAfterMs).toBe(600_000);
   });
 
   it("parses disk cleanup configuration", () => {

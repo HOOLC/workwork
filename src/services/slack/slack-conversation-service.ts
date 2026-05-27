@@ -150,7 +150,8 @@ export class SlackConversationService {
     this.#turnReconciler = new SlackTurnReconciler({
       sessions: this.#sessions,
       turnRunner: this.#turnRunner,
-      inboundStore: this.#inboundStore
+      inboundStore: this.#inboundStore,
+      staleActiveTurnAfterMs: this.#config.slackStaleActiveTurnAfterMs
     });
     this.#agentRuntimeEventHandler = (event) => {
       this.#handleAgentRuntimeEvent(event);
