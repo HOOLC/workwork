@@ -1,5 +1,5 @@
 services:
-  slack-codex-broker:
+  workwork:
     build:
       context: .
     environment:
@@ -10,7 +10,7 @@ services:
       SLACK_INITIAL_THREAD_HISTORY_COUNT: ${SLACK_INITIAL_THREAD_HISTORY_COUNT:-8}
       SLACK_HISTORY_API_MAX_LIMIT: ${SLACK_HISTORY_API_MAX_LIMIT:-50}
       PORT: ${PORT:-3000}
-      SERVICE_NAME: ${SERVICE_NAME:-slack-codex-broker}
+      SERVICE_NAME: ${SERVICE_NAME:-workwork}
       DATA_ROOT: ${DATA_ROOT:-/app/.data}
       SESSIONS_ROOT: ${SESSIONS_ROOT:-/app/.data/sessions}
       REPOS_ROOT: ${REPOS_ROOT:-/app/.data/repos}

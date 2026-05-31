@@ -1,16 +1,16 @@
 {
-  "name": "agent-session-broker-repo",
+  "name": "workwork",
   "version": "0.1.26",
   "private": true,
   "description": "Slack + China Feishu broker that routes chat sessions into Codex app-server sessions with isolated workspaces.",
-  "homepage": "https://github.com/HOOLC/slack-codex-broker#readme",
+  "homepage": "https://github.com/HOOLC/workwork#readme",
   "bugs": {
-    "url": "https://github.com/HOOLC/slack-codex-broker/issues"
+    "url": "https://github.com/HOOLC/workwork/issues"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/HOOLC/slack-codex-broker.git"
+    "url": "git+https://github.com/HOOLC/workwork.git"
   },
   "type": "module",
   "scripts": {

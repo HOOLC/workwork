@@ -112,7 +112,7 @@ export class IsolatedMcpService {
       authProvider,
     });
     const client = new Client({
-      name: "slack-codex-broker",
+      name: "workwork",
       version: "0.1.0",
     });
     await client.connect(transport as unknown as Transport);
@@ -204,8 +204,8 @@ class StoredOauthProvider implements OAuthClientProvider {
   get clientMetadata(): OAuthClientMetadata {
     return {
       redirect_uris: [],
-      client_name: "slack-codex-broker",
-      client_uri: "https://github.com/HOOLC/slack-codex-broker",
+      client_name: "workwork",
+      client_uri: "https://github.com/HOOLC/workwork",
       grant_types: this.#entry.refresh_token ? ["refresh_token"] : ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: this.#entry.client_secret ? "client_secret_post" : "none",

@@ -1,15 +1,15 @@
 {
   "name": "@agent-session-broker/worker",
   "version": "0.1.26",
-  "description": "Worker runtime for the agent session broker.",
-  "homepage": "https://github.com/HOOLC/slack-codex-broker#readme",
+  "description": "Worker runtime for Workwork.",
+  "homepage": "https://github.com/HOOLC/workwork#readme",
   "bugs": {
-    "url": "https://github.com/HOOLC/slack-codex-broker/issues"
+    "url": "https://github.com/HOOLC/workwork/issues"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/HOOLC/slack-codex-broker.git"
+    "url": "git+https://github.com/HOOLC/workwork.git"
   },
   "files": [
     "dist/src/",

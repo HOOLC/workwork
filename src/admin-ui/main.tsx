@@ -34,4 +34,4 @@ if (!rootElement) {
 
 document.body.classList.toggle("session-permalink-page", sessionPermalinkPage);
 
-createRoot(rootElement).render(<AdminShell serviceName={config.serviceName || "slack-codex-broker"} />);
+createRoot(rootElement).render(<AdminShell serviceName={config.serviceName || "workwork"} />);
