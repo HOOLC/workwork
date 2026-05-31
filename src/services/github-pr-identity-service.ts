@@ -500,7 +500,7 @@ export class GitHubPrIdentityService {
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${token}`,
-        "user-agent": "slack-codex-broker",
+        "user-agent": "workwork",
       },
     });
     const raw = await readJsonResponse(response);
@@ -521,7 +521,7 @@ export class GitHubPrIdentityService {
         headers: {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${token}`,
-          "user-agent": "slack-codex-broker",
+          "user-agent": "workwork",
         },
       }),
     );

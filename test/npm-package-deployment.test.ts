@@ -25,31 +25,51 @@ describe("npm package deployment contract", () => {
     };
     const adminPackageJson = JSON.parse(await fs.readFile(new URL("../packages/admin/package.json", import.meta.url), "utf8")) as {
       readonly name?: string;
+      readonly repository?: { readonly url?: string };
+      readonly bugs?: { readonly url?: string };
+      readonly homepage?: string;
       readonly publishConfig?: Record<string, string>;
       readonly files?: readonly string[];
       readonly bin?: Record<string, string>;
     };
     const workerPackageJson = JSON.parse(await fs.readFile(new URL("../packages/worker/package.json", import.meta.url), "utf8")) as {
       readonly name?: string;
+      readonly repository?: { readonly url?: string };
+      readonly bugs?: { readonly url?: string };
+      readonly homepage?: string;
       readonly publishConfig?: Record<string, string>;
       readonly files?: readonly string[];
     };
 
     expect(packageJson).toMatchObject({
-      name: "agent-session-broker-repo",
+      name: "workwork",
       private: true,
     });
-    expect(packageJson.repository?.url).toBe("git+https://github.com/HOOLC/slack-codex-broker.git");
-    expect(packageJson.bugs?.url).toBe("https://github.com/HOOLC/slack-codex-broker/issues");
-    expect(packageJson.homepage).toBe("https://github.com/HOOLC/slack-codex-broker#readme");
+    expect(packageJson.repository?.url).toBe("git+https://github.com/HOOLC/workwork.git");
+    expect(packageJson.bugs?.url).toBe("https://github.com/HOOLC/workwork/issues");
+    expect(packageJson.homepage).toBe("https://github.com/HOOLC/workwork#readme");
     expect(adminPackageJson).toMatchObject({
       name: "@agent-session-broker/admin",
+      homepage: "https://github.com/HOOLC/workwork#readme",
+      bugs: {
+        url: "https://github.com/HOOLC/workwork/issues",
+      },
+      repository: {
+        url: "git+https://github.com/HOOLC/workwork.git",
+      },
       bin: {
         "agent-session-broker-macos-bootstrap": "./scripts/ops/macos-bootstrap.mjs",
       },
     });
     expect(workerPackageJson).toMatchObject({
       name: "@agent-session-broker/worker",
+      homepage: "https://github.com/HOOLC/workwork#readme",
+      bugs: {
+        url: "https://github.com/HOOLC/workwork/issues",
+      },
+      repository: {
+        url: "git+https://github.com/HOOLC/workwork.git",
+      },
     });
     expect(adminPackageJson.publishConfig).toMatchObject({
       access: "public",

@@ -312,7 +312,7 @@ export function loadConfig(env = process.env): AppConfig {
     workerBaseUrl: env.WORKER_BASE_URL ?? `http://${workerBindHost}:${workerPort}`,
     adminBaseUrl: env.ADMIN_BASE_URL ?? `http://127.0.0.1:${port}`,
     brokerHttpBaseUrl: env.BROKER_HTTP_BASE_URL ?? `http://127.0.0.1:${port}`,
-    serviceName: env.SERVICE_NAME ?? "slack-codex-broker",
+    serviceName: env.SERVICE_NAME ?? "workwork",
     brokerAdminToken: getOptional(env, "BROKER_ADMIN_TOKEN"),
     adminLaunchdLabel: getOptional(env, "ADMIN_LAUNCHD_LABEL"),
     workerLaunchdLabel: getOptional(env, "WORKER_LAUNCHD_LABEL"),

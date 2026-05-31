@@ -74,7 +74,7 @@ describe("admin routes", () => {
     const previous = process.env.ADMIN_UI_DEV_ORIGIN;
     process.env.ADMIN_UI_DEV_ORIGIN = "http://127.0.0.1:5173/";
     try {
-      const html = renderAdminPage({ serviceName: "slack-codex-broker" });
+      const html = renderAdminPage({ serviceName: "workwork" });
       expect(html).toContain("http://127.0.0.1:5173/admin/@react-refresh");
       expect(html).toContain("__vite_plugin_react_preamble_installed__");
       expect(html).toContain("http://127.0.0.1:5173/admin/@vite/client");

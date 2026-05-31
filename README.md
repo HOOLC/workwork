@@ -1,12 +1,12 @@
-# slack-codex-broker
+# workwork
 
-Minimal Slack + China Feishu bridge to Codex for multi-repository workflows.
+Workwork is a Slack + China Feishu broker that routes chat sessions into Codex app-server sessions with isolated workspaces.
 
-It connects to Slack over Socket Mode, starts or resumes one Codex app-server thread per Slack thread, and gives each Slack session an isolated workspace directory. The Codex session always starts in that neutral workspace instead of being pinned to a specific repository. If code work is needed, the agent is expected to use a shared `repos/` cache for canonical clones and create any task-specific git worktrees under the current session workspace. Normal thread replies continue the same Codex thread. Sending `-stop` in the thread interrupts the current Codex turn.
+It connects to Slack over Socket Mode and to China Feishu over long connection. Each Slack thread or Feishu topic can start or resume one Codex app-server thread, backed by an isolated workspace directory. The Codex session always starts in that neutral workspace instead of being pinned to a specific repository. If code work is needed, the agent is expected to use a shared `repos/` cache for canonical clones and create any task-specific git worktrees under the current session workspace. Normal thread/topic replies continue the same Codex thread. Sending `-stop` interrupts the current Codex turn.
 
-On the first `@bot` inside an existing Slack thread, the broker backfills a bounded slice of earlier thread history into Codex. If Codex needs older context than the initial backfill, it can query the broker's local thread-history HTTP API from inside its shell.
+Slack remains a first-class runtime: on the first `@bot` inside an existing Slack thread, the broker backfills a bounded slice of earlier thread history into Codex. If Codex needs older context than the initial backfill, it can query the broker's local thread-history HTTP API from inside its shell.
 
-Feishu support runs in the same broker process as Slack. Feishu group `@bot ...`: create or resume a group session; private chats are ignored. For production parity, configure `FEISHU_ENABLED=true`, `FEISHU_GROUP_MESSAGE_MODE=all`, `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and at least one Feishu bot identity. `at_only` is a visible degraded mode; set `FEISHU_ALL_MESSAGE_DELIVERY_VERIFIED=true` only after the real non-@ follow-up smoke passes; keep `LOG_RAW_FEISHU_EVENTS=false` unless collecting a focused, redacted fixture.
+Feishu support runs in the same broker process as Slack. Feishu group `@bot ...` messages create or resume a group session, Feishu topic replies act as the Slack-thread equivalent, and private chats are ignored. For production parity, configure `FEISHU_ENABLED=true`, `FEISHU_GROUP_MESSAGE_MODE=all`, `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and at least one Feishu bot identity. `at_only` is a visible degraded mode; set `FEISHU_ALL_MESSAGE_DELIVERY_VERIFIED=true` only after the real non-@ follow-up smoke passes; keep `LOG_RAW_FEISHU_EVENTS=false` unless collecting a focused, redacted fixture.
 
 Feishu rollout:
 
@@ -55,6 +55,7 @@ Admin and chat APIs are platform-aware:
 ## What It Expects
 
 - A Slack app using Socket Mode
+- For Feishu support, a China Feishu self-built app with bot, long-connection event delivery, message send, card callback, and resource permissions
 - Codex authentication via either:
   - `OPENAI_API_KEY`
   - a mounted `auth.json` plus `CODEX_AUTH_JSON_PATH`
@@ -199,7 +200,7 @@ pnpm ops:auth:profiles use backup-account
 pnpm ops:ui:real
 ```
 
-`ops:rollout:real` reuses the current `slack-codex-broker-real` container's env vars and bind mounts, refuses to restart while active turns exist unless you pass `--allow-active`, rebuilds the image, recreates the container, and then runs the fixed post-update checks. Each rollout also writes sanitized metadata plus pre-rollout logs under `.backups/rollouts/`.
+`ops:rollout:real` reuses the configured real container's env vars and bind mounts (default legacy container name: `slack-codex-broker-real`), refuses to restart while active turns exist unless you pass `--allow-active`, rebuilds the image, recreates the container, and then runs the fixed post-update checks. Each rollout also writes sanitized metadata plus pre-rollout logs under `.backups/rollouts/`.
 `ops:status:real` prints a structured runtime snapshot for the live container, including health, active sessions, open inbound messages, background jobs, and recent broker logs. Use `--open-inbound-limit` and `--log-lines` to tune output volume.
 `ops:auth:real status` prints the live container's Codex auth files, runtime account identity, any quota/usage fields exposed by `account/read`, plus the current session state snapshot.
 `ops:auth:profiles` manages a local auth-profile directory under the live data root. The host auth is kept as a reference copy, while the docker auth points at a selectable `active` profile. Use `bootstrap` once, then `import-host --name <profile>` or `import --name <profile> --from <path>` to add more docker-side auth profiles, and `use <profile>` to switch the live container.
@@ -221,7 +222,7 @@ There is no host-side code sync or production build step in the normal path.
 
 ```bash
 npm install -g @agent-session-broker/admin@0.1.2
-agent-session-broker-macos-bootstrap --service-root ~/services/slack-codex-broker --package-version 0.1.2 --start-worker
+agent-session-broker-macos-bootstrap --service-root ~/services/workwork --package-version 0.1.2 --start-worker
 ```
 
 The bootstrap script installs `@agent-session-broker/admin@<version>` and
@@ -242,7 +243,7 @@ What it prepares:
 - support homes under `runtime-support/`
 - launchd agents for:
   - `io.github.hoolc.agent-session-broker` (admin/control plane)
-  - `io.github.hoolc.agent-session-broker.worker` (Slack/Codex worker)
+  - `io.github.hoolc.agent-session-broker.worker` (chat/Codex worker)
 
 What it does not do:
 
