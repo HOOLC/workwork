@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path as StdPath;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -16,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
+use crate::im_entry::{visible_message_json, LOCAL_GUI_ENTRY_ID, LOCAL_GUI_PLATFORM};
 use crate::jobs::JobSupervisor;
 use crate::state::AppState;
 use crate::{delivery, timeline};
@@ -24,6 +26,28 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/readyz", get(readyz))
         .route("/healthz", get(readyz))
+        .route("/v1/im/profiles", get(local_im_profiles))
+        .route(
+            "/v1/im/sessions",
+            get(list_local_im_sessions).post(create_local_im_session),
+        )
+        .route(
+            "/v1/im/sessions/{session_id}/context",
+            get(get_local_im_context).put(update_local_im_context),
+        )
+        .route(
+            "/v1/im/sessions/{session_id}/selection",
+            axum::routing::put(update_local_im_selection),
+        )
+        .route(
+            "/v1/im/sessions/{session_id}/messages",
+            get(list_local_im_messages).post(post_local_im_message),
+        )
+        .route("/v1/im/sessions/{session_id}/events", get(local_im_events))
+        .route(
+            "/v1/im/sessions/{session_id}/cancel",
+            post(cancel_local_im_session),
+        )
         .route("/internal/realtime/sessions", get(list_sessions))
         .route("/internal/realtime/snapshot", get(snapshot))
         .route("/internal/realtime/logs", get(logs))
@@ -37,9 +61,9 @@ pub fn router(state: AppState) -> Router {
             "/internal/realtime/sessions/{session_key}/timeline-events/{event_id}",
             get(timeline_event),
         )
-        .route("/slack/sessions/{session_key}/reset", post(reset_session))
-        .route("/slack/sessions/{session_key}", delete(delete_session))
-        .route("/slack/github-token/resolve", post(resolve_github_token))
+        .route("/sessions/{session_key}/reset", post(reset_session))
+        .route("/sessions/{session_key}", delete(delete_session))
+        .route("/github-token/resolve", post(resolve_github_token))
         .route("/jobs/register", post(register_job))
         .route("/jobs/{job_id}/admin-cancel", post(cancel_job))
         .route("/notify", post(notify))
@@ -53,28 +77,396 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn local_im_profiles(State(state): State<AppState>) -> Response {
+    match crate::agent::profile_list_value(&state.config).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => fail(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn list_local_im_sessions(State(state): State<AppState>) -> Response {
+    let statuses = crate::agent::session_statuses(&state.config)
+        .await
+        .unwrap_or_default();
+    match state.db.list_sessions() {
+        Ok(sessions) => {
+            let items = sessions
+                .iter()
+                .filter(|session| session.platform == LOCAL_GUI_PLATFORM)
+                .filter_map(|session| {
+                    let session_id = session.id.as_deref()?;
+                    Some(local_im_session_json(
+                        session,
+                        statuses
+                            .get(session_id)
+                            .map(String::as_str)
+                            .unwrap_or("wait"),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            Json(json!({ "items": items })).into_response()
+        }
+        Err(error) => db_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateLocalImSession {
+    profile_id: String,
+    model: String,
+    thinking: String,
+    workspace: String,
+}
+
+async fn create_local_im_session(
+    State(state): State<AppState>,
+    Json(request): Json<CreateLocalImSession>,
+) -> Response {
+    if [
+        request.profile_id.as_str(),
+        request.model.as_str(),
+        request.thinking.as_str(),
+        request.workspace.as_str(),
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
+    {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "profile_id, model, thinking, and workspace are required",
+        );
+    }
+    let workspace = match fs::canonicalize(request.workspace.trim()) {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => return fail(StatusCode::BAD_REQUEST, "workspace_is_not_a_directory"),
+        Err(error) => {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid_workspace: {error}"),
+            )
+        }
+    };
+    let conversation_id = format!("conversation-{}", ulid::Ulid::new());
+    let session = match state.db.create_session_at_workspace(
+        crate::db::EnsureSession {
+            connection_id: LOCAL_GUI_ENTRY_ID,
+            platform: LOCAL_GUI_PLATFORM,
+            channel_id: &conversation_id,
+            root_thread_ts: &conversation_id,
+            channel_type: Some("desktop"),
+            initiator_user_id: Some("local-user"),
+            initiator_message_ts: None,
+        },
+        &workspace,
+    ) {
+        Ok(session) => session,
+        Err(error) => return db_error(error),
+    };
+    let binding = crate::db::SessionBindingRow::Normal(session.clone());
+    let selection = crate::agent::SessionSelection {
+        profile_id: request.profile_id,
+        model: request.model,
+        thinking: request.thinking,
+    };
+    match crate::agent::create_binding_session(&state.config, &state.db, &binding, &selection).await
+    {
+        Ok(created) => {
+            let session = match state.db.get_session(&session.key) {
+                Ok(Some(session)) => session,
+                Ok(None) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "binding_disappeared"),
+                Err(error) => return db_error(error),
+            };
+            state
+                .status_projection
+                .ensure(
+                    &session.key,
+                    &created.session_id,
+                    &session.connection_id,
+                    &session.channel_id,
+                    &session.root_thread_ts,
+                )
+                .await;
+            (
+                StatusCode::CREATED,
+                Json(local_im_session_json(&session, "wait")),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            let _ = state.db.delete_session(&session.key);
+            fail(error.status, &error.message)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateLocalImSelection {
+    profile_id: String,
+    model: String,
+    thinking: String,
+}
+
+async fn get_local_im_context(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    local_im_context(&state, &session_id, None).await
+}
+
+async fn update_local_im_context(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Result<Json<zork_agent_api::ContextConfig>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(config) = match body {
+        Ok(config) => config,
+        Err(_) => return fail(StatusCode::UNPROCESSABLE_ENTITY, "invalid_context"),
+    };
+    local_im_context(&state, &session_id, Some(&config)).await
+}
+
+async fn local_im_context(
+    state: &AppState,
+    session_id: &str,
+    update: Option<&zork_agent_api::ContextConfig>,
+) -> Response {
+    if let Err(response) = local_im_session(state, session_id) {
+        return *response;
+    }
+    match crate::agent::session_context(&state.config, session_id, update).await {
+        Ok(config) => Json(config).into_response(),
+        Err(error) => fail(error.status, &error.message),
+    }
+}
+
+async fn update_local_im_selection(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<UpdateLocalImSelection>,
+) -> Response {
+    let session = match local_im_session(&state, &session_id) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let selection = crate::agent::SessionSelection {
+        profile_id: request.profile_id,
+        model: request.model,
+        thinking: request.thinking,
+    };
+    match crate::agent::update_selection(&state.config, &session_id, &selection).await {
+        Ok(updated) => {
+            if let Err(error) = state.db.set_agent_session(
+                &session.key,
+                &session_id,
+                &session.workspace_path,
+                &updated.profile_id,
+                &updated.model,
+                &updated.thinking,
+            ) {
+                return db_error(error);
+            }
+            match state.db.get_session(&session.key) {
+                Ok(Some(session)) => Json(local_im_session_json(&session, "wait")).into_response(),
+                Ok(None) => fail(StatusCode::INTERNAL_SERVER_ERROR, "binding_disappeared"),
+                Err(error) => db_error(error),
+            }
+        }
+        Err(error) => fail(error.status, &error.message),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostLocalImMessage {
+    content: String,
+}
+
+async fn post_local_im_message(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<PostLocalImMessage>,
+) -> Response {
+    if request.content.trim().is_empty() {
+        return fail(StatusCode::BAD_REQUEST, "content is required");
+    }
+    let session = match local_im_session(&state, &session_id) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    state
+        .status_projection
+        .ensure(
+            &session.key,
+            &session_id,
+            &session.connection_id,
+            &session.channel_id,
+            &session.root_thread_ts,
+        )
+        .await;
+    let message_id = ulid::Ulid::new().to_string();
+    let message =
+        match state
+            .entries
+            .accept_local_user_message(&session, &message_id, &request.content)
+        {
+            Ok(message) => message,
+            Err(error) => return db_error(error),
+        };
+    if let Err(error) =
+        crate::agent::append_mailbox(&state.config, &session_id, &request.content).await
+    {
+        return fail(StatusCode::BAD_GATEWAY, &error.to_string());
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "ok": true, "message": visible_message_json(&message) })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalMessageQuery {
+    before: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list_local_im_messages(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<LocalMessageQuery>,
+) -> Response {
+    let session = match local_im_session(&state, &session_id) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=100).contains(&limit) {
+        return fail(StatusCode::BAD_REQUEST, "limit must be between 1 and 100");
+    }
+    let before = match query.before {
+        Some(cursor) => match cursor.parse::<i64>() {
+            Ok(cursor) if cursor > 0 => Some(cursor),
+            _ => return fail(StatusCode::BAD_REQUEST, "invalid message cursor"),
+        },
+        None => None,
+    };
+    match state.db.list_visible_messages(&session.key, before, limit) {
+        Ok(messages) => {
+            let older_cursor = messages.first().and_then(|message| {
+                state
+                    .db
+                    .has_visible_messages_before(&session.key, message.sequence)
+                    .ok()
+                    .filter(|has_older| *has_older)
+                    .map(|_| message.sequence.to_string())
+            });
+            Json(json!({
+                "items": messages.iter().map(visible_message_json).collect::<Vec<_>>(),
+                "older_cursor": older_cursor,
+            }))
+            .into_response()
+        }
+        Err(error) => db_error(error),
+    }
+}
+
+async fn local_im_events(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let session = match local_im_session(&state, &session_id) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let receiver = state.entries.subscribe_local(&session.key);
+    let events = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(entry) => {
+                    let event = Event::default()
+                        .event(entry.name)
+                        .data(entry.data.to_string());
+                    return Some((Ok::<_, Infallible>(event), receiver));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn cancel_local_im_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    if let Err(response) = local_im_session(&state, &session_id) {
+        return *response;
+    }
+    match crate::agent::cancel_session(&state.config, &session_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => fail(StatusCode::NOT_FOUND, "agent_session_not_found"),
+        Err(error) => fail(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+fn local_im_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<crate::db::SessionRow, Box<Response>> {
+    match state.db.get_session_by_id(session_id) {
+        Ok(Some(session)) if session.platform == LOCAL_GUI_PLATFORM => Ok(session),
+        Ok(_) => Err(Box::new(fail(
+            StatusCode::NOT_FOUND,
+            "local_im_session_not_found",
+        ))),
+        Err(error) => Err(Box::new(db_error(error))),
+    }
+}
+
+fn local_im_session_json(session: &crate::db::SessionRow, status: &str) -> Value {
+    json!({
+        "session_id": session.id,
+        "profile_id": session.profile_id,
+        "model": session.model,
+        "thinking": session.thinking,
+        "workspace": session.workspace_path,
+        "status": if status == "working" { "working" } else { "wait" },
+    })
+}
+
 pub fn gateway_router(state: AppState) -> Router {
     Router::new()
         .route("/readyz", get(readyz))
         .route("/healthz", get(readyz))
-        .route("/bot", get(bot_identity))
+        .route("/sessions/{session_key}/im/bot", get(bot_identity))
         .route(
-            "/threads/{conversation_id}/{root_message_id}",
+            "/sessions/{session_key}/im/threads/{conversation_id}/{root_message_id}",
             get(gateway_thread_history),
         )
+        .route("/sessions/{session_key}/im/download", get(slack_download))
         .route(
-            "/threads/{conversation_id}/{root_message_id}/status",
-            post(set_thread_status),
+            "/sessions/{session_key}/im/raw/{method}",
+            post(slack_method),
         )
-        .route("/slack/download", get(slack_download))
-        .route("/slack/{method}", post(slack_method))
         .with_state(state)
 }
 
-async fn bot_identity(State(state): State<AppState>) -> Response {
-    match state.slack.fetch_bot_self().await {
+async fn bot_identity(State(state): State<AppState>, Path(session_key): Path<String>) -> Response {
+    let context = match bound_context(&state, &decode(&session_key)) {
+        Ok(context) => context,
+        Err(error) => return fail(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let Some(connection) = state.connections.runtime(&context.connection_id).await else {
+        return fail(StatusCode::NOT_FOUND, "session_connection_not_found");
+    };
+    match connection.slack.fetch_bot_self().await {
         Ok(bot) => {
-            *state.bot.lock().await = Some(crate::slack::BotSelf {
+            *connection.bot.lock().await = Some(crate::slack::BotSelf {
                 user_id: bot.user_id.clone(),
                 mention: bot.mention.clone(),
                 raw: bot.raw.clone(),
@@ -94,10 +486,20 @@ struct ThreadHistoryQuery {
 
 async fn gateway_thread_history(
     State(state): State<AppState>,
-    Path((conversation_id, root_message_id)): Path<(String, String)>,
+    Path((session_key, conversation_id, root_message_id)): Path<(String, String, String)>,
     Query(query): Query<ThreadHistoryQuery>,
 ) -> Response {
-    let payload = match state
+    let context = match bound_context(&state, &decode(&session_key)) {
+        Ok(context) => context,
+        Err(error) => return fail(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    if let Err(error) = context.validate_destination(&conversation_id, &root_message_id) {
+        return fail(StatusCode::BAD_REQUEST, &error.to_string());
+    }
+    let Some(connection) = state.connections.runtime(&context.connection_id).await else {
+        return fail(StatusCode::NOT_FOUND, "session_connection_not_found");
+    };
+    let payload = match connection
         .slack
         .thread_history(
             &conversation_id,
@@ -110,7 +512,7 @@ async fn gateway_thread_history(
         Ok(payload) => payload,
         Err(error) => return fail(StatusCode::BAD_GATEWAY, &error.to_string()),
     };
-    let bot = state.bot.lock().await;
+    let bot = connection.bot.lock().await;
     let bot_identity = bot.as_ref().map(|bot| zork_slack::BotIdentity {
         user_id: bot.user_id.clone(),
         bot_id: None,
@@ -164,28 +566,18 @@ fn slack_ts_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ThreadStatusBody {
-    #[serde(default)]
-    status: String,
-}
-
-async fn set_thread_status(
-    State(state): State<AppState>,
-    Path((conversation_id, root_message_id)): Path<(String, String)>,
-    body: Option<Json<ThreadStatusBody>>,
-) -> Response {
-    let status = body.map(|Json(body)| body.status).unwrap_or_default();
-    let key = format!("{conversation_id}:{root_message_id}");
-    state.status.set(&key, &status).await;
-    Json(json!({ "ok": true })).into_response()
-}
-
 async fn slack_method(
     State(state): State<AppState>,
-    Path(method): Path<String>,
+    Path((session_key, method)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    let context = match bound_context(&state, &decode(&session_key)) {
+        Ok(context) => context,
+        Err(error) => return fail(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let Some(connection) = state.connections.runtime(&context.connection_id).await else {
+        return fail(StatusCode::NOT_FOUND, "session_connection_not_found");
+    };
     let method = method.trim_matches('/');
     if method.is_empty() || method.contains("..") || method.contains('/') {
         return fail(StatusCode::BAD_REQUEST, "invalid_method");
@@ -195,7 +587,7 @@ async fn slack_method(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    match state.slack.api().call(method, &fields).await {
+    match connection.slack.api().call(method, &fields).await {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => fail(StatusCode::BAD_GATEWAY, &error.to_string()),
     }
@@ -248,13 +640,25 @@ struct DownloadQuery {
 
 async fn slack_download(
     State(state): State<AppState>,
+    Path(session_key): Path<String>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let config = &state.config;
-    if !is_allowed_slack_download(&query.url, &config.slack_api_base_url) {
+    let context = match bound_context(&state, &decode(&session_key)) {
+        Ok(context) => context,
+        Err(error) => return fail(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let Some(connection) = state.connections.runtime(&context.connection_id).await else {
+        return fail(StatusCode::NOT_FOUND, "session_connection_not_found");
+    };
+    let api_base_url = connection
+        .config
+        .slack()
+        .map(zork_config::SlackProviderConfig::api_base_url)
+        .unwrap_or_default();
+    if !is_allowed_slack_download(&query.url, &api_base_url) {
         return fail(StatusCode::BAD_REQUEST, "invalid_download_url");
     }
-    match state.slack.download(&query.url).await {
+    match connection.slack.download(&query.url).await {
         Ok((bytes, content_type)) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, content_type)],
@@ -274,12 +678,14 @@ fn is_allowed_slack_download(url: &str, slack_api_base_url: &str) -> bool {
     }
     let host = target.host_str().unwrap_or_default();
     if host == "files.slack.com" || host == "slack-files.com" {
-        return true;
+        return target.scheme() == "https";
     }
-    reqwest::Url::parse(slack_api_base_url)
-        .ok()
-        .and_then(|api| api.host_str().map(str::to_string))
-        .is_some_and(|api_host| api_host == host)
+    let Ok(api) = reqwest::Url::parse(slack_api_base_url) else {
+        return false;
+    };
+    api.scheme() == target.scheme()
+        && api.host_str() == target.host_str()
+        && api.port_or_known_default() == target.port_or_known_default()
 }
 
 pub async fn bind_listener(addr: std::net::SocketAddr) -> anyhow::Result<TcpListener> {
@@ -423,12 +829,12 @@ pub async fn timeline(
     Query(query): Query<TimelineQuery>,
 ) -> Response {
     let session_key = decode(&session_key);
-    let Some(session) = state.db.get_session(&session_key).ok().flatten() else {
+    let Some(binding) = state.db.get_binding(&session_key).ok().flatten() else {
         return not_found("session_not_found", &session_key);
     };
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    match timeline::load_page(&state.db, &session, limit, query.before_sequence) {
-        Ok(page) => match state.db.session_summary(&session) {
+    match timeline::load_page(&state.db, &binding, limit, query.before_sequence) {
+        Ok(page) => match state.db.binding_summary(&binding) {
             Ok(summary) => Json(json!({
                 "ok": true,
                 "session": summary,
@@ -452,10 +858,10 @@ pub async fn timeline_event(
     Path((session_key, event_id)): Path<(String, String)>,
 ) -> Response {
     let session_key = decode(&session_key);
-    let Some(session) = state.db.get_session(&session_key).ok().flatten() else {
+    let Some(binding) = state.db.get_binding(&session_key).ok().flatten() else {
         return not_found("session_not_found", &session_key);
     };
-    match timeline::load_event(&state.db, &session, &event_id) {
+    match timeline::load_event(&state.db, &binding, &event_id) {
         Ok(Some(event)) => Json(json!({ "ok": true, "event": event })).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -514,19 +920,23 @@ async fn resolve_github_token(State(state): State<AppState>, Json(body): Json<Va
     let Some(cwd) = read_string(&body, &["cwd"]) else {
         return missing(&["cwd"]);
     };
-    let Some(session) = state.db.find_session_by_workspace(&cwd).ok().flatten() else {
+    let Some(binding) = state.db.find_binding_by_workspace(&cwd).ok().flatten() else {
         return (
             StatusCode::CONFLICT,
             Json(json!({
                 "ok": false,
                 "mode": "blocked",
                 "reason": "session_not_found",
-                "message": format!("No Slack session is associated with {cwd}."),
+                "message": format!("No Agent session is associated with {cwd}."),
             })),
         )
             .into_response();
     };
-    if let Some(user_id) = &session.initiator_user_id {
+    let initiator_user_id = match &binding {
+        crate::db::SessionBindingRow::Normal(session) => session.initiator_user_id.clone(),
+        crate::db::SessionBindingRow::Proactive(_) => None,
+    };
+    if let Some(user_id) = &initiator_user_id {
         if let Some(mapping) = read_github_mapping(&state, user_id) {
             return Json(json!({
                 "ok": true,
@@ -548,8 +958,8 @@ async fn resolve_github_token(State(state): State<AppState>, Json(body): Json<Va
             "defaultSource": "env",
             "githubLogin": login,
             "token": token,
-            "reason": if session.initiator_user_id.is_some() { "initiator_unbound" } else { "missing_initiator" },
-            "slackUserId": session.initiator_user_id,
+            "reason": if initiator_user_id.is_some() { "initiator_unbound" } else { "missing_initiator" },
+            "slackUserId": initiator_user_id,
         }))
         .into_response();
     }
@@ -560,29 +970,27 @@ async fn resolve_github_token(State(state): State<AppState>, Json(body): Json<Va
             "mode": "blocked",
             "reason": "default_account_unavailable",
             "message": "No GitHub token is bound for this session.",
-            "slackUserId": session.initiator_user_id,
+            "slackUserId": initiator_user_id,
         })),
     )
         .into_response()
 }
 
 async fn register_job(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    let conversation_id = read_string(&body, &["conversation_id", "conversationId"]);
-    let root_message_id = read_string(&body, &["root_message_id", "rootMessageId"]);
+    let session_key = read_string(&body, &["session_key", "sessionKey"]);
     let kind = read_string(&body, &["kind"]);
     let script = read_string(&body, &["script"]);
-    let Some((conversation_id, root_message_id, kind, script)) = conversation_id
-        .zip(root_message_id)
+    let Some((session_key, kind, script)) = session_key
         .zip(kind)
         .zip(script)
-        .map(|(((a, b), c), d)| (a, b, c, d))
+        .map(|((a, b), c)| (a, b, c))
     else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "ok": false,
                 "error": "missing_required_body",
-                "required": ["conversationId (alias: conversation_id)", "rootMessageId (alias: root_message_id)", "kind", "script"],
+                "required": ["sessionKey", "kind", "script"],
             })),
         )
             .into_response();
@@ -596,8 +1004,7 @@ async fn register_job(State(state): State<AppState>, Json(body): Json<Value>) ->
     match state
         .jobs
         .register(
-            &conversation_id,
-            &root_message_id,
+            &session_key,
             &kind,
             &script,
             cwd.as_deref(),
@@ -640,18 +1047,15 @@ pub async fn cancel_job(
 }
 
 async fn notify(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    let conversation_id = read_string(&body, &["conversation_id", "conversationId"]);
-    let root_message_id = read_string(&body, &["root_message_id", "rootMessageId"]);
+    let session_key = read_string(&body, &["session_key", "sessionKey"]);
     let text = read_string(&body, &["text"]);
-    let Some(((conversation_id, root_message_id), text)) =
-        conversation_id.zip(root_message_id).zip(text)
-    else {
-        return missing(&["conversationId", "rootMessageId", "text"]);
+    let Some((session_key, text)) = session_key.zip(text) else {
+        return missing(&["sessionKey", "text"]);
     };
     let job_id = read_string(&body, &["jobId", "job_id"]);
     match state
         .jobs
-        .notify(job_id.as_deref(), &text, &conversation_id, &root_message_id)
+        .notify(job_id.as_deref(), &text, &session_key)
         .await
     {
         Ok(result) => Json(json!({ "ok": true, "result": result })).into_response(),
@@ -669,6 +1073,8 @@ async fn notify(State(state): State<AppState>, Json(body): Json<Value>) -> Respo
 
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
+    #[serde(rename = "sessionKey", alias = "session_key")]
+    session_key: Option<String>,
     platform: Option<String>,
     conversation_id: Option<String>,
     #[serde(rename = "conversationId")]
@@ -690,15 +1096,13 @@ async fn thread_history(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
 ) -> Response {
-    if let Some(platform) = query.platform.as_deref() {
-        if platform != "slack" {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "ok": false, "error": "invalid_platform", "allowed": ["slack"] })),
-            )
-                .into_response();
-        }
-    }
+    let Some(session_key) = query.session_key.as_deref() else {
+        return missing(&["sessionKey"]);
+    };
+    let context = match bound_context(&state, session_key) {
+        Ok(context) => context,
+        Err(error) => return fail(StatusCode::NOT_FOUND, &error.to_string()),
+    };
     let conversation_id = query
         .conversation_id
         .as_deref()
@@ -713,10 +1117,94 @@ async fn thread_history(
             Json(json!({
                 "ok": false,
                 "error": "missing_required_query",
-                "required": ["platform", "conversationId (alias: conversation_id)", "rootMessageId (alias: root_message_id)"],
+                "required": ["sessionKey", "conversationId (alias: conversation_id)", "rootMessageId (alias: root_message_id)"],
             })),
         )
             .into_response();
+    };
+    if let Err(error) = context.validate_destination(conversation_id, root_message_id) {
+        return fail(StatusCode::BAD_REQUEST, &error.to_string());
+    }
+    if query
+        .platform
+        .as_deref()
+        .is_some_and(|platform| platform != context.platform)
+    {
+        return fail(StatusCode::BAD_REQUEST, "session_platform_mismatch");
+    }
+    if context.platform == LOCAL_GUI_PLATFORM {
+        let before = query
+            .before_message_id
+            .as_deref()
+            .or(query.before_message_id_camel.as_deref())
+            .or(query.before_cursor.as_deref())
+            .or(query.before_cursor_camel.as_deref());
+        let before = match before {
+            Some(value) => match value.parse::<i64>() {
+                Ok(value) if value > 0 => Some(value),
+                _ => return fail(StatusCode::BAD_REQUEST, "invalid message cursor"),
+            },
+            None => None,
+        };
+        let limit = query.limit.unwrap_or(50).clamp(1, 100);
+        let messages = match state
+            .db
+            .list_visible_messages(&context.session_key, before, limit)
+        {
+            Ok(messages) => messages,
+            Err(error) => return db_error(error),
+        };
+        let has_more = messages.first().is_some_and(|message| {
+            state
+                .db
+                .has_visible_messages_before(&context.session_key, message.sequence)
+                .unwrap_or(false)
+        });
+        let rows = messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "messageId": message.sequence.to_string(),
+                    "senderKind": message.role,
+                    "text": message.text,
+                    "kind": message.kind,
+                    "createdAt": message.created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let formatted = messages
+            .iter()
+            .map(|message| format!("{}: {}", message.role, message.text))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if query.format.as_deref() == Some("text") {
+            return (
+                StatusCode::OK,
+                [("content-type", "text/plain; charset=utf-8")],
+                if formatted.is_empty() {
+                    "No earlier chat history matched the request.".to_owned()
+                } else {
+                    formatted
+                },
+            )
+                .into_response();
+        }
+        return Json(json!({
+            "ok": true,
+            "platform": context.platform,
+            "connectionId": context.connection_id,
+            "conversationId": conversation_id,
+            "rootMessageId": root_message_id,
+            "returnedCount": rows.len(),
+            "hasMore": has_more,
+            "maxLimit": 100,
+            "messages": rows,
+            "formattedText": formatted,
+        }))
+        .into_response();
+    }
+    let Some(connection) = state.connections.runtime(&context.connection_id).await else {
+        return fail(StatusCode::CONFLICT, "session_connection_unavailable");
     };
     let before = query
         .before_message_id
@@ -724,7 +1212,7 @@ async fn thread_history(
         .or(query.before_message_id_camel.as_deref())
         .or(query.before_cursor.as_deref())
         .or(query.before_cursor_camel.as_deref());
-    match state
+    match connection
         .slack
         .thread_history(
             conversation_id,
@@ -759,7 +1247,8 @@ async fn thread_history(
             }
             Json(json!({
                 "ok": true,
-                "platform": "slack",
+                "platform": context.platform,
+                "connectionId": context.connection_id,
                 "conversationId": conversation_id,
                 "rootMessageId": root_message_id,
                 "returnedCount": payload.get("messages").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
@@ -775,9 +1264,13 @@ async fn thread_history(
 }
 
 async fn post_message(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    if invalid_platform(&body) {
-        return invalid_platform_response();
-    }
+    let Some(session_key) = read_string(&body, &["session_key", "sessionKey"]) else {
+        return missing(&["sessionKey"]);
+    };
+    let context = match bound_context(&state, &session_key) {
+        Ok(context) => context,
+        Err(error) => return fail(StatusCode::NOT_FOUND, &error.to_string()),
+    };
     let conversation_id = read_string(&body, &["conversation_id", "conversationId"]);
     let root_message_id = read_string(&body, &["root_message_id", "rootMessageId"]);
     let text = read_string(&body, &["text"]);
@@ -785,12 +1278,15 @@ async fn post_message(State(state): State<AppState>, Json(body): Json<Value>) ->
         conversation_id.zip(root_message_id).zip(text)
     else {
         return missing(&[
-            "platform",
+            "sessionKey",
             "conversationId (alias: conversation_id)",
             "rootMessageId (alias: root_message_id)",
             "text",
         ]);
     };
+    if let Err(error) = context.validate_destination(&conversation_id, &root_message_id) {
+        return fail(StatusCode::BAD_REQUEST, &error.to_string());
+    }
     let kind = read_string(&body, &["kind"]);
     if let Some(kind) = kind.as_deref() {
         if !matches!(kind, "progress" | "final" | "block" | "wait") {
@@ -817,17 +1313,19 @@ async fn post_message(State(state): State<AppState>, Json(body): Json<Value>) ->
     }
     match delivery::post_message(
         &state,
+        &context.session_key,
         &conversation_id,
         &root_message_id,
         &text,
         kind.as_deref(),
-        reason.as_deref(),
     )
     .await
     {
         Ok(()) => Json(json!({
             "ok": true,
-            "platform": "slack",
+            "platform": context.platform,
+            "connectionId": context.connection_id,
+            "sessionKey": context.session_key,
             "conversationId": conversation_id,
             "rootMessageId": root_message_id,
         }))
@@ -837,13 +1335,23 @@ async fn post_message(State(state): State<AppState>, Json(body): Json<Value>) ->
 }
 
 async fn post_file(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    if invalid_platform(&body) {
-        return invalid_platform_response();
-    }
+    let Some(session_key) = read_string(&body, &["session_key", "sessionKey"]) else {
+        return missing(&["sessionKey"]);
+    };
+    let context = match bound_context(&state, &session_key) {
+        Ok(context) => context,
+        Err(error) => return fail(StatusCode::NOT_FOUND, &error.to_string()),
+    };
     let conversation_id = read_string(&body, &["conversation_id", "conversationId"]);
     let root_message_id = read_string(&body, &["root_message_id", "rootMessageId"]);
     let Some((conversation_id, root_message_id)) = conversation_id.zip(root_message_id) else {
-        return missing(&["conversationId", "rootMessageId"]);
+        return missing(&["sessionKey", "conversationId", "rootMessageId"]);
+    };
+    if let Err(error) = context.validate_destination(&conversation_id, &root_message_id) {
+        return fail(StatusCode::BAD_REQUEST, &error.to_string());
+    }
+    let Some(connection) = state.connections.runtime(&context.connection_id).await else {
+        return fail(StatusCode::CONFLICT, "session_connection_unavailable");
     };
     let file_path = read_string(&body, &["file_path", "filePath"]);
     let content_b64 = read_string(&body, &["content_base64", "contentBase64"]);
@@ -877,7 +1385,7 @@ async fn post_file(State(state): State<AppState>, Json(body): Json<Value>) -> Re
     };
     let title = read_string(&body, &["title"]);
     let comment = read_string(&body, &["initial_comment", "initialComment"]);
-    match state
+    match connection
         .slack
         .upload_file(
             &conversation_id,
@@ -894,6 +1402,46 @@ async fn post_file(State(state): State<AppState>, Json(body): Json<Value>) -> Re
     }
 }
 
+struct BoundImContext {
+    connection_id: String,
+    platform: String,
+    mode: zork_config::ImMode,
+    session_key: String,
+    conversation_id: Option<String>,
+    root_message_id: Option<String>,
+}
+
+impl BoundImContext {
+    fn validate_destination(
+        &self,
+        conversation_id: &str,
+        root_message_id: &str,
+    ) -> anyhow::Result<()> {
+        if self.mode == zork_config::ImMode::Normal
+            && (self.conversation_id.as_deref() != Some(conversation_id)
+                || self.root_message_id.as_deref() != Some(root_message_id))
+        {
+            anyhow::bail!("session_destination_mismatch");
+        }
+        Ok(())
+    }
+}
+
+fn bound_context(state: &AppState, session_key: &str) -> anyhow::Result<BoundImContext> {
+    let binding = state
+        .db
+        .get_binding(session_key)?
+        .context("session_not_found")?;
+    Ok(BoundImContext {
+        connection_id: binding.connection_id().to_owned(),
+        platform: binding.platform().to_owned(),
+        mode: binding.mode(),
+        session_key: binding.key().to_owned(),
+        conversation_id: binding.conversation_id().map(str::to_owned),
+        root_message_id: binding.root_message_id().map(str::to_owned),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct CliQuery {
     #[serde(rename = "threadId", alias = "thread_id")]
@@ -907,27 +1455,29 @@ async fn cli_context(State(state): State<AppState>, Query(query): Query<CliQuery
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let session = if let Some(thread_id) = thread_id {
-        state.db.get_session_by_id(thread_id).ok().flatten()
+    let binding = if let Some(thread_id) = thread_id {
+        state.db.get_binding_by_id(thread_id).ok().flatten()
     } else if let Some(cwd) = query.cwd.as_deref() {
-        state.db.find_session_by_workspace(cwd).ok().flatten()
+        state.db.find_binding_by_workspace(cwd).ok().flatten()
     } else {
         return fail(StatusCode::BAD_REQUEST, "missing_thread_id");
     };
-    let Some(session) = session else {
-        return fail(StatusCode::NOT_FOUND, "unknown_thread");
-    };
-    Json(json!({
-        "ok": true,
-        "platform": "slack",
-        "conversationId": session.channel_id,
-        "rootMessageId": session.root_thread_ts,
-        "channelId": session.channel_id,
-        "rootThreadTs": session.root_thread_ts,
-        "sessionKey": session.key,
-        "workspacePath": session.workspace_path,
-    }))
-    .into_response()
+    if let Some(binding) = binding {
+        return Json(json!({
+            "ok": true,
+            "connectionId": binding.connection_id(),
+            "platform": binding.platform(),
+            "mode": binding.mode(),
+            "conversationId": binding.conversation_id(),
+            "rootMessageId": binding.root_message_id(),
+            "channelId": binding.conversation_id(),
+            "rootThreadTs": binding.root_message_id(),
+            "sessionKey": binding.key(),
+            "workspacePath": binding.workspace_path(),
+        }))
+        .into_response();
+    }
+    fail(StatusCode::NOT_FOUND, "unknown_thread")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1013,20 +1563,6 @@ fn read_string(body: &Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
-}
-
-fn invalid_platform(body: &Value) -> bool {
-    body.get("platform")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value != "slack")
-}
-
-fn invalid_platform_response() -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "ok": false, "error": "invalid_platform", "allowed": ["slack"] })),
-    )
-        .into_response()
 }
 
 fn missing(required: &[&str]) -> Response {

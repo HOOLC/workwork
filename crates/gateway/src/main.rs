@@ -2,16 +2,19 @@ mod admin;
 mod agent;
 mod binshim;
 mod config;
+mod connections;
 mod control_db;
 mod control_github;
 mod db;
 mod delivery;
 mod http;
+mod im_entry;
 mod inbound;
 mod jobs;
 mod slack;
 mod socket;
 mod state;
+mod status_projection;
 mod timeline;
 
 use anyhow::Result;
@@ -22,7 +25,6 @@ use tracing::{error, info};
 use crate::config::RuntimeConfig;
 use crate::db::GatewayDb;
 use crate::jobs::JobSupervisor;
-use crate::slack::SlackGateway;
 use crate::state::AppState;
 
 #[tokio::main]
@@ -51,33 +53,22 @@ async fn main() -> Result<()> {
 
     let db = Arc::new(GatewayDb::open(&config.state_dir, &config.workspaces_root)?);
     let http_client = reqwest::Client::builder().no_proxy().build()?;
-    let slack = SlackGateway::new(&config, http_client.clone());
-    let status = zork_slack::AssistantStatusHub::with_token_provider(
-        http_client.clone(),
-        config.slack_bot_token.clone(),
-        config.slack_api_base_url.clone(),
-        {
-            let data_root = config.data_root.clone();
-            std::sync::Arc::new(move || {
-                zork_config::load_config(&data_root).ok().map(|file| {
-                    (
-                        file.slack.bot_token.trim().to_string(),
-                        zork_config::slack_api_base_url(&file),
-                    )
-                })
-            })
-        },
+    let connections = Arc::new(
+        connections::ConnectionManager::load(config.data_root.clone(), http_client.clone()).await?,
     );
+    let entries = im_entry::ImEntryGateway::new(db.clone(), connections.clone());
+    let status_projection =
+        status_projection::AgentStatusProjector::new(config.clone(), entries.clone())?;
     let jobs = Arc::new(JobSupervisor::new(db.clone(), config.clone()));
     jobs.restore().await?;
 
     let state = AppState {
         config: config.clone(),
         db: db.clone(),
-        slack,
-        status,
+        connections,
+        entries,
+        status_projection,
         jobs,
-        bot: Arc::new(tokio::sync::Mutex::new(None)),
         admin: state::AdminPlane {
             db: Arc::new(control_db::ControlDb::open(&config.state_dir)?),
             admin_token: zork_config::load_config(&config.data_root)
@@ -95,6 +86,21 @@ async fn main() -> Result<()> {
             reload_sock: zork_config::zork_sock_path(&config.data_root),
         },
     };
+
+    for session in db.list_sessions()? {
+        if let Some(agent_session_id) = session.id.as_deref() {
+            state
+                .status_projection
+                .ensure(
+                    &session.key,
+                    agent_session_id,
+                    &session.connection_id,
+                    &session.channel_id,
+                    &session.root_thread_ts,
+                )
+                .await;
+        }
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -144,7 +150,7 @@ async fn main() -> Result<()> {
                 error!(error = %error, "admin http exited");
             }
         }
-        _ = socket::run_socket(state.clone(), shutdown_rx) => {}
+        _ = socket::run_connections(state.clone(), shutdown_rx) => {}
         _ = shutdown_signal() => {
             info!("gateway shutting down");
             let _ = shutdown_tx.send(true);

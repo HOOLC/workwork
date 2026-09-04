@@ -18,6 +18,7 @@ pub struct ProviderExecution {
     pub parallel_tool_calls: bool,
     pub service_tier: Option<String>,
     pub thinking: String,
+    pub limits: crate::ModelLimits,
     pub base_url: String,
     pub headers: HashMap<String, String>,
     pub bearer: String,
@@ -31,13 +32,17 @@ pub async fn load_selected(
     thinking: &str,
 ) -> Result<ProviderExecution> {
     let mut document = crate::app::read(paths, profile_id)?;
-    let (api, streaming, parallel_tool_calls, service_tier) = {
+    let (api, streaming, parallel_tool_calls, service_tier, limits) = {
         let selected_model = crate::app::select_model(&document, model, thinking)?;
         (
             selected_model.api.as_str().to_owned(),
             selected_model.streaming,
             selected_model.parallel_tool_calls,
             selected_model.service_tier.clone(),
+            selected_model
+                .limits
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("model {model} does not declare token limits"))?,
         )
     };
     let provider = providers::get(&document.provider)?;
@@ -49,7 +54,8 @@ pub async fn load_selected(
         crate::app::write(paths, profile_id, &document)?;
     }
     let template = provider.template(&document.billing)?;
-    let (base_url, headers) = prepare_endpoint(provider, &document, &template)?;
+    let (base_url, mut headers) = prepare_endpoint(provider, &document, &template)?;
+    provider.decorate_execution_headers(&document.billing, model, &mut headers);
     Ok(ProviderExecution {
         profile_id: profile_id.to_owned(),
         provider: document.provider,
@@ -59,6 +65,7 @@ pub async fn load_selected(
         parallel_tool_calls,
         service_tier,
         thinking: thinking.to_owned(),
+        limits,
         base_url,
         headers,
         bearer: provider.bearer(&document.auth)?,

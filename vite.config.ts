@@ -32,20 +32,20 @@ export default defineConfig({
       builtin: true,
       node: true,
     },
-    ignorePatterns: ["dist/**", "target/**", "crates/**", "artifacts/**", "node_modules/**", ".data/**", "apps/*/dist/**", "apps/*/node_modules/**"],
+    ignorePatterns: ["dist/**", "target/**", "target-linux/**", "crates/**", "artifacts/**", "node_modules/**", ".data/**", "apps/*/dist/**", "apps/*/node_modules/**"],
     options: {
       denyWarnings: true,
     },
   },
   fmt: {
     printWidth: 320,
-    ignorePatterns: ["dist/**", "target/**", "crates/**", "artifacts/**", "docs/**", "evidence/**", "pnpm-lock.yaml", "Cargo.lock"],
+    ignorePatterns: ["dist/**", "target/**", "target-linux/**", "crates/**", "artifacts/**", "docs/**", "evidence/**", "pnpm-lock.yaml", "Cargo.lock"],
   },
   run: {
     cache: true,
   },
   test: {
-    include: ["test/**/*.test.ts"],
+    include: ["test/**/*.test.ts", "apps/admin-ui/test/**/*.test.{ts,tsx}"],
     environment: "node",
   },
   staged: {

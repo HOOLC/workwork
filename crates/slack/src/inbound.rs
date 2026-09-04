@@ -24,6 +24,13 @@ pub struct BotIdentity {
     pub surface: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SlackMessageMode {
+    #[default]
+    Thread,
+    Proactive,
+}
+
 impl BotIdentity {
     pub fn mention(&self) -> String {
         format!("<@{}>", self.user_id)
@@ -48,8 +55,17 @@ pub fn parse_socket_payload(
     payload: &Value,
     bot: &BotIdentity,
 ) -> Option<(String, Value)> {
+    parse_socket_payload_for_mode(kind, payload, bot, SlackMessageMode::Thread)
+}
+
+pub fn parse_socket_payload_for_mode(
+    kind: &str,
+    payload: &Value,
+    bot: &BotIdentity,
+    mode: SlackMessageMode,
+) -> Option<(String, Value)> {
     match kind {
-        "events_api" => parse_events_api(payload, bot),
+        "events_api" => parse_events_api(payload, bot, mode),
         _ => None,
     }
 }
@@ -81,7 +97,7 @@ pub fn parse_history_message(
     if should_ignore_event(&event, bot) {
         return None;
     }
-    let parsed = parse_message_event(&event, bot)?;
+    let parsed = parse_message_event(&event, bot, SlackMessageMode::Thread)?;
     let parsed_root = parsed.get("rootMessageId").and_then(Value::as_str)?;
     if parsed_root != root_message_id {
         return None;
@@ -89,7 +105,11 @@ pub fn parse_history_message(
     Some(parsed)
 }
 
-fn parse_events_api(payload: &Value, bot: &BotIdentity) -> Option<(String, Value)> {
+fn parse_events_api(
+    payload: &Value,
+    bot: &BotIdentity,
+    mode: SlackMessageMode,
+) -> Option<(String, Value)> {
     let event_id = payload.get("event_id")?.as_str()?.trim();
     if event_id.is_empty() {
         return None;
@@ -101,7 +121,7 @@ fn parse_events_api(payload: &Value, bot: &BotIdentity) -> Option<(String, Value
     if should_ignore_event(event, bot) {
         return None;
     }
-    let parsed = parse_message_event(event, bot)?;
+    let parsed = parse_message_event(event, bot, mode)?;
     Some((event_id.to_string(), parsed))
 }
 
@@ -138,7 +158,7 @@ fn is_self_authored(event: &Value, bot: &BotIdentity) -> bool {
     false
 }
 
-fn parse_message_event(event: &Value, bot: &BotIdentity) -> Option<Value> {
+fn parse_message_event(event: &Value, bot: &BotIdentity, mode: SlackMessageMode) -> Option<Value> {
     let event_type = event.get("type")?.as_str()?;
     let conversation_id = nonempty(event.get("channel").and_then(Value::as_str))?;
     let message_id = nonempty(event.get("ts").and_then(Value::as_str))?;
@@ -164,6 +184,12 @@ fn parse_message_event(event: &Value, bot: &BotIdentity) -> Option<Value> {
             let root = nonempty(event.get("thread_ts").and_then(Value::as_str))
                 .unwrap_or_else(|| message_id.clone());
             ("direct_message", root)
+        }
+        "message" if mode == SlackMessageMode::Proactive => {
+            match nonempty(event.get("thread_ts").and_then(Value::as_str)) {
+                Some(root) => ("thread_reply", root),
+                None => ("channel_message", message_id.clone()),
+            }
         }
         "message" => {
             let root = nonempty(event.get("thread_ts").and_then(Value::as_str))?;
@@ -377,6 +403,34 @@ mod tests {
         assert_eq!(parsed["self"]["surface"], "Slack");
         assert_eq!(parsed["self"]["username"], "zork");
         assert_eq!(parsed["self"]["displayName"], "Zork");
+    }
+
+    #[test]
+    fn proactive_mode_accepts_an_unmentioned_channel_root_message() {
+        let payload = json!({
+            "event_id": "evt-proactive-root",
+            "event": {
+                "type": "message",
+                "user": "U123",
+                "channel": "C123",
+                "channel_type": "channel",
+                "ts": "100.200",
+                "text": "an ordinary channel message"
+            }
+        });
+
+        assert!(parse_socket_payload("events_api", &payload, &bot()).is_none());
+        let (_, parsed) = parse_socket_payload_for_mode(
+            "events_api",
+            &payload,
+            &bot(),
+            SlackMessageMode::Proactive,
+        )
+        .expect("proactive channel message");
+        assert_eq!(parsed["source"], "channel_message");
+        assert_eq!(parsed["conversationId"], "C123");
+        assert_eq!(parsed["rootMessageId"], "100.200");
+        assert_eq!(parsed["messageId"], "100.200");
     }
 
     #[test]

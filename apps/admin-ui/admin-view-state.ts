@@ -4,7 +4,7 @@ export function loadAdminView(): AdminView {
   try {
     const raw = window.localStorage.getItem(uiStateStorageKey());
     const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
-    return parsed.adminView === "ops" ? "ops" : "sessions";
+    return parsed.adminView === "ops" || parsed.adminView === "connections" ? parsed.adminView : "sessions";
   } catch {
     return "sessions";
   }

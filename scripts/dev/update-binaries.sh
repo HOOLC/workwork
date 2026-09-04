@@ -12,14 +12,7 @@ mkdir -p .data/bin
 
 docker compose --profile tools run --rm --no-deps rust-build bash -c '
   set -euo pipefail
-  cargo build --release -p zork -p zork-gateway -p zork-agent -p zork-call
-  mkdir -p /src/.data/bin
-  for bin in zork zork-gateway zork-agent zork-call zork-gh; do
-    cp "/src/target/release/${bin}" "/src/.data/bin/${bin}.new"
-    chmod +x "/src/.data/bin/${bin}.new"
-    mv -f "/src/.data/bin/${bin}.new" "/src/.data/bin/${bin}"
-    echo "wrote /src/.data/bin/${bin}"
-  done
+  bash /src/scripts/dev/release-build.sh
 '
 if docker compose ps -q zork | grep -q .; then
   docker compose exec zork /data/bin/zork update --data /data

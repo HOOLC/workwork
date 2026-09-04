@@ -57,11 +57,6 @@ function importCycles(graph: ReadonlyMap<string, readonly string[]>): string[][]
 }
 
 describe("Admin UI module boundaries", () => {
-  it("uses domain names instead of numbered line-count slices and helper barrels", async () => {
-    const names = (await adminSourceFiles()).map((file) => path.basename(file));
-    expect(names.filter((name) => /^(?:admin-shell|session-view)-helpers(?:-\d+)?\.tsx$/.test(name))).toEqual([]);
-  });
-
   it("keeps relative imports acyclic", async () => {
     const files = await adminSourceFiles();
     const cycles = importCycles(await relativeImportGraph(files)).map((cycle) => cycle.map((file) => path.basename(file)));

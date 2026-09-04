@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { getAdminStatusSnapshot, subscribeAdminStatus } from "./admin-status-store";
+import type { ImConnection } from "./im-connections";
 import { SessionDetail } from "./session-detail.js";
 import { SessionListRow } from "./session-list.js";
 import { stableSessionOrder } from "./session-order";
@@ -10,7 +11,7 @@ import { buildChannelLabelById } from "./session-row-display";
 import type { SessionRecord, UiState } from "./session-types.js";
 import { loadUiState, normalizeUiState, persistUiState, readGitHubBindSessionKey, readPermalinkSessionKey } from "./session-view-state.js";
 
-export function AdminSessionsView(): React.JSX.Element {
+export function AdminSessionsView({ connections = [] }: { readonly connections?: readonly ImConnection[] }): React.JSX.Element {
   const githubBindSessionKey = readGitHubBindSessionKey();
   if (githubBindSessionKey) {
     return <GitHubBindPage sessionKey={githubBindSessionKey} />;
@@ -23,7 +24,11 @@ export function AdminSessionsView(): React.JSX.Element {
 
   const snapshot = useSyncExternalStore(subscribeAdminStatus, getAdminStatusSnapshot, getAdminStatusSnapshot);
   const status = (snapshot.status || {}) as Record<string, any>;
-  const sessions = (status.state?.sessions || []) as SessionRecord[];
+  const connectionNames = new Map(connections.map((connection) => [connection.id, connection.name]));
+  const sessions = ((status.state?.sessions || []) as SessionRecord[]).map<SessionRecord>((session) => ({
+    ...session,
+    connectionName: connectionNames.get(String(session.connectionId || "")) || session.connectionName || session.connectionId,
+  }));
   const state = status.state || {};
   const channelLabelById = useMemo(() => buildChannelLabelById(sessions), [sessions]);
   const [uiState, setUiState] = useState(loadUiState);

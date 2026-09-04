@@ -18,10 +18,6 @@ pub struct InboundEvent {
 }
 
 impl InboundEvent {
-    pub fn session_key(&self) -> String {
-        format!("{}:{}", self.conversation_id, self.root_message_id)
-    }
-
     pub fn is_stop(&self) -> bool {
         self.control_text.trim() == "-stop" && self.attachments.is_empty()
     }
@@ -47,7 +43,7 @@ pub fn parse_inbound_value(value: &Value) -> Option<InboundEvent> {
     let source = nonempty(value.get("source").and_then(Value::as_str))?;
     if !matches!(
         source.as_str(),
-        "app_mention" | "thread_reply" | "direct_message"
+        "app_mention" | "thread_reply" | "direct_message" | "channel_message"
     ) {
         return None;
     }
@@ -132,7 +128,8 @@ mod tests {
         })
         .to_string();
         let event = parse_inbound_payload(&raw).unwrap();
-        assert_eq!(event.session_key(), "C123:100.200");
+        assert_eq!(event.conversation_id, "C123");
+        assert_eq!(event.root_message_id, "100.200");
         assert_eq!(event.control_text, "hello");
         assert!(!event.is_stop());
     }

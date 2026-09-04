@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
 use crate::config::RuntimeConfig;
+use crate::connections::ConnectionManager;
 use crate::db::GatewayDb;
+use crate::im_entry::ImEntryGateway;
 use crate::jobs::JobSupervisor;
-
-use crate::slack::{BotSelf, SlackGateway};
-use zork_slack::AssistantStatusHub;
+use crate::status_projection::AgentStatusProjector;
 
 /// Admin-plane attachments; None only during early construction.
 #[derive(Clone)]
@@ -23,10 +21,10 @@ pub struct AdminPlane {
 pub struct AppState {
     pub config: RuntimeConfig,
     pub db: Arc<GatewayDb>,
-    pub slack: SlackGateway,
-    pub status: AssistantStatusHub,
+    pub connections: Arc<ConnectionManager>,
+    pub entries: ImEntryGateway,
+    pub status_projection: AgentStatusProjector,
 
     pub jobs: Arc<JobSupervisor>,
-    pub bot: Arc<Mutex<Option<BotSelf>>>,
     pub admin: AdminPlane,
 }

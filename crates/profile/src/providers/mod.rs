@@ -135,6 +135,13 @@ pub trait AuthProvider: Send + Sync {
     fn info(&self) -> ProviderInfo;
     fn template(&self, billing: &str) -> Result<ProfileTemplate>;
     fn decorate_document(&self, _document: &mut Value) {}
+    fn decorate_execution_headers(
+        &self,
+        _billing: &str,
+        _model: &str,
+        _headers: &mut std::collections::HashMap<String, String>,
+    ) {
+    }
     fn bearer(&self, auth: &Value) -> Result<String>;
     async fn probe(&self, http: &Client, document: &Value) -> Result<QuotaSnapshot>;
     async fn refresh_auth(&self, http: &Client, auth: Value) -> Result<Value>;

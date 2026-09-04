@@ -58,7 +58,7 @@ export function ProfilesPanel({ status, message, setMessage, onAdd }: { readonly
                       <Badge label={profile.auth_configured ? "认证已配置" : "缺少认证"} tone={profile.auth_configured ? "good" : "danger"} />
                     </div>
                     <div className="profile-card-subtitle">{profileRuntimeLabel(profile)}</div>
-                    <div className="profile-card-subtitle">{(profile.models || []).map((model: Record<string, any>) => `${model.id} · thinking: ${(model.thinking || []).join("/")} · input: ${(model.capabilities?.input || []).join("/")}`).join("；")}</div>
+                    <ProfileModels models={profile.models} />
                     {issue ? <div className="profile-card-subtitle">{issue}</div> : null}
                   </div>
                   <button
@@ -86,6 +86,50 @@ export function ProfilesPanel({ status, message, setMessage, onAdd }: { readonly
       ) : null}
     </section>
   );
+}
+
+function ProfileModels({ models }: { readonly models: unknown }): React.JSX.Element {
+  const items = Array.isArray(models) ? models : [];
+  return (
+    <div className="profile-models">
+      <div className="profile-models-title">可用模型</div>
+      {items.length ? (
+        items.map((model: Record<string, any>, index: number) => {
+          const thinking = stringItems(model.thinking);
+          const inputs = stringItems(model.capabilities?.input).map(inputCapabilityLabel);
+          return (
+            <div className="profile-model" key={`${String(model.id || "model")}:${index}`}>
+              <div className="profile-model-name">
+                <strong>{String(model.id || "未命名模型")}</strong>
+                {model.default ? <span className="profile-model-default">默认</span> : null}
+              </div>
+              <div className="profile-model-meta">
+                <span>思考深度：{thinking.length ? thinking.join(" / ") : "未配置"}</span>
+                <span>输入：{inputs.length ? inputs.join(" / ") : "未配置"}</span>
+              </div>
+            </div>
+          );
+        })
+      ) : (
+        <div className="profile-model-empty">未配置模型</div>
+      )}
+    </div>
+  );
+}
+
+function stringItems(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function inputCapabilityLabel(value: string): string {
+  const labels: Record<string, string> = {
+    text: "文本",
+    image: "图片",
+    audio: "音频",
+    video: "视频",
+  };
+  return labels[value] || value;
 }
 
 export function AddProfileDialog({ onClose, onStatus }: { readonly onClose: () => void; readonly onStatus: (message: string | null) => void }): React.JSX.Element {

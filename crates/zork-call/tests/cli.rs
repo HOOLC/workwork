@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 struct Captured {
     method: String,
+    target: String,
     path: String,
     body: String,
 }
@@ -87,7 +88,12 @@ fn read_http(stream: &mut std::net::TcpStream) -> Option<Captured> {
         .or_else(|| buf.get(header_end + 4..))
         .map(|slice| String::from_utf8_lossy(slice).into_owned())
         .unwrap_or_default();
-    Some(Captured { method, path, body })
+    Some(Captured {
+        method,
+        target,
+        path,
+        body,
+    })
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
@@ -109,9 +115,12 @@ fn content_length_of(headers: &[u8]) -> usize {
 
 fn zork_call() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zork-call"));
-    cmd.env_remove("CHAT_PLATFORM")
+    cmd.env_remove("SESSION_KEY")
+        .env_remove("CHAT_PLATFORM")
+        .env_remove("CHAT_CONNECTION_ID")
         .env_remove("CHAT_CONVERSATION_ID")
         .env_remove("CHAT_ROOT_MESSAGE_ID")
+        .env_remove("ZORK_AGENT_SESSION_ID")
         .env_remove("BROKER_JOB_ID")
         .stdin(Stdio::null());
     cmd
@@ -143,7 +152,9 @@ fn post_message_hits_broker() {
             "progress",
         ])
         .env("BROKER_API_BASE", &url)
+        .env("SESSION_KEY", "connection-1:C123:1.2")
         .env("CHAT_PLATFORM", "slack")
+        .env("CHAT_CONNECTION_ID", "connection-1")
         .env("CHAT_CONVERSATION_ID", "C123")
         .env("CHAT_ROOT_MESSAGE_ID", "1.2")
         .output()
@@ -160,8 +171,209 @@ fn post_message_hits_broker() {
     let body: Value = serde_json::from_str(&captured[0].body).unwrap();
     assert_eq!(body["conversationId"], "C123");
     assert_eq!(body["rootMessageId"], "1.2");
+    assert_eq!(body["sessionKey"], "connection-1:C123:1.2");
     assert_eq!(body["text"], "hello");
     assert_eq!(body["kind"], "progress");
+}
+
+#[test]
+fn agent_session_id_resolves_the_exact_gateway_binding_before_cwd() {
+    let (url, requests) = start_mock(|request| {
+        if request.path == "/cli/context" {
+            return (
+                200,
+                json!({
+                    "ok": true,
+                    "platform": "local_gui",
+                    "connectionId": "local_gui",
+                    "sessionKey": "local_gui:conversation-2:conversation-2",
+                    "conversationId": "conversation-2",
+                    "rootMessageId": "conversation-2"
+                })
+                .to_string(),
+            );
+        }
+        (200, json!({ "ok": true }).to_string())
+    });
+    let output = zork_call()
+        .args([
+            "chat",
+            "post-message",
+            "--text",
+            "reply from task two",
+            "--kind",
+            "final",
+        ])
+        .env("BROKER_API_BASE", &url)
+        .env("ZORK_AGENT_SESSION_ID", "agent-session-2")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].path, "/cli/context");
+    assert!(
+        captured[0].target.contains("threadId=agent-session-2"),
+        "Agent tools must resolve by exact Agent session id, got {}",
+        captured[0].target
+    );
+    assert_eq!(captured[1].path, "/chat/post-message");
+    let body: Value = serde_json::from_str(&captured[1].body).unwrap();
+    assert_eq!(
+        body["sessionKey"],
+        "local_gui:conversation-2:conversation-2"
+    );
+}
+
+#[test]
+fn slack_post_message_uses_only_its_explicit_destination() {
+    let (url, requests) = start_mock(|_| (200, json!({ "ok": true }).to_string()));
+    let output = zork_call()
+        .args([
+            "slack",
+            "post-message",
+            "--channel-id",
+            "C-PROACTIVE",
+            "--thread-ts",
+            "9.8",
+            "--text",
+            "useful answer",
+        ])
+        .env("BROKER_API_BASE", &url)
+        .env("SESSION_KEY", "connection-2:proactive")
+        .env("CHAT_PLATFORM", "slack")
+        .env("CHAT_CONNECTION_ID", "connection-2")
+        .env("CHAT_CONVERSATION_ID", "C-WRONG")
+        .env("CHAT_ROOT_MESSAGE_ID", "1.2")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/chat/post-message");
+    let body: Value = serde_json::from_str(&captured[0].body).unwrap();
+    assert_eq!(body["platform"], "slack");
+    assert_eq!(body["sessionKey"], "connection-2:proactive");
+    assert_eq!(body["conversationId"], "C-PROACTIVE");
+    assert_eq!(body["rootMessageId"], "9.8");
+    assert_eq!(body["text"], "useful answer");
+    assert!(body.get("kind").is_none());
+}
+
+#[test]
+fn slack_commands_never_fall_back_to_session_coordinates() {
+    let output = zork_call()
+        .args([
+            "slack",
+            "post-message",
+            "--channel-id",
+            "C-PROACTIVE",
+            "--text",
+            "must not be sent",
+        ])
+        .env("BROKER_API_BASE", "http://127.0.0.1:9")
+        .env("CHAT_CONVERSATION_ID", "C-WRONG")
+        .env("CHAT_ROOT_MESSAGE_ID", "1.2")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--thread-ts"));
+}
+
+#[test]
+fn slack_thread_history_uses_its_explicit_destination() {
+    let (url, requests) = start_mock(|request| {
+        if request.path == "/cli/context" {
+            return (
+                200,
+                json!({
+                    "ok": true,
+                    "platform": "slack",
+                    "connectionId": "connection-2",
+                    "sessionKey": "connection-2:proactive",
+                    "mode": "proactive"
+                })
+                .to_string(),
+            );
+        }
+        (200, "history".to_owned())
+    });
+    let output = zork_call()
+        .args([
+            "slack",
+            "thread-history",
+            "--channel-id",
+            "C-PROACTIVE",
+            "--thread-ts",
+            "9.8",
+            "--format",
+            "text",
+        ])
+        .env("BROKER_API_BASE", &url)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].path, "/cli/context");
+    assert_eq!(captured[1].method, "GET");
+    assert_eq!(captured[1].path, "/chat/thread-history");
+    assert!(captured[1]
+        .target
+        .contains("session_key=connection-2%3Aproactive"));
+    assert!(captured[1].target.contains("conversation_id=C-PROACTIVE"));
+    assert!(captured[1].target.contains("root_message_id=9.8"));
+    assert!(captured[1].target.contains("format=text"));
+}
+
+#[test]
+fn slack_post_file_uses_its_explicit_destination() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let path = file.path().to_string_lossy().into_owned();
+    let (url, requests) = start_mock(|_| (200, json!({ "ok": true }).to_string()));
+    let output = zork_call()
+        .args([
+            "slack",
+            "post-file",
+            "--channel-id",
+            "C-PROACTIVE",
+            "--thread-ts",
+            "9.8",
+            "--file-path",
+            &path,
+        ])
+        .env("BROKER_API_BASE", &url)
+        .env("SESSION_KEY", "connection-2:proactive")
+        .env("CHAT_PLATFORM", "slack")
+        .env("CHAT_CONNECTION_ID", "connection-2")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/chat/post-file");
+    let body: Value = serde_json::from_str(&captured[0].body).unwrap();
+    assert_eq!(body["conversationId"], "C-PROACTIVE");
+    assert_eq!(body["rootMessageId"], "9.8");
+    assert_eq!(body["sessionKey"], "connection-2:proactive");
+    assert_eq!(body["filePath"], path);
 }
 
 #[test]
@@ -171,7 +383,9 @@ fn notify_sends_content_without_a_mailbox_identity() {
         .args(["notify", "--text", "job finished"])
         .env("BROKER_API_BASE", &url)
         .env("BROKER_JOB_ID", "job-1")
+        .env("SESSION_KEY", "connection-1:C123:1.2")
         .env("CHAT_PLATFORM", "slack")
+        .env("CHAT_CONNECTION_ID", "connection-1")
         .env("CHAT_CONVERSATION_ID", "C123")
         .env("CHAT_ROOT_MESSAGE_ID", "1.2")
         .output()
@@ -186,6 +400,7 @@ fn notify_sends_content_without_a_mailbox_identity() {
     assert_eq!(captured[0].path, "/notify");
     let body: Value = serde_json::from_str(&captured[0].body).unwrap();
     assert_eq!(body["jobId"], "job-1");
+    assert_eq!(body["sessionKey"], "connection-1:C123:1.2");
     assert_eq!(body["text"], "job finished");
     assert!(body.get("messageId").is_none());
     assert!(body.get("message_id").is_none());

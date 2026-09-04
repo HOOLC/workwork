@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::config::RuntimeConfig;
 use zork_slack::SlackApi;
 use zork_slack::{chunk_slack_message, markdownish_to_mrkdwn};
 
@@ -19,11 +18,11 @@ pub struct BotSelf {
 }
 
 impl SlackGateway {
-    pub fn new(config: &RuntimeConfig, http: reqwest::Client) -> Self {
+    pub fn new(config: &zork_config::SlackProviderConfig, http: reqwest::Client) -> Self {
         Self {
             api: SlackApi::new(
-                config.slack_bot_token.clone(),
-                config.slack_api_base_url.clone(),
+                config.bot_token.trim().to_string(),
+                config.api_base_url(),
                 http,
             ),
         }

@@ -6,18 +6,19 @@ use std::{
     time::Duration,
 };
 
-mod provider;
-
 use axum::{routing::get, Json, Router};
-use provider::{FakeProvider, ProviderRouter};
 use serde_json::json;
 use zork_agent::{
     http,
+    provider::{AgentModelPort, FakeProvider, ProviderRouter},
     session::{
-        runtime::{AgentDefinition, Runtime, RuntimeOptions, TimerArm, TimerPort},
-        store::JsonlEventStore,
-        timer::{SleepTimer, SystemClock},
-        tools::{coding_tool_names, WorkspaceToolExecutor},
+        ports::{
+            ModelExecutor, SystemClock, SystemFileSystem, SystemIdGenerator, SystemProcessSpawner,
+        },
+        query::FileSessionQuery,
+        service::{ServiceDependencies, ServiceOptions, SessionService},
+        tools::{register_builtin_tools, BuiltinToolDependencies, ToolRegistry},
+        StreamStore,
     },
     ProfileStore,
 };
@@ -69,49 +70,51 @@ async fn run(
     no_streaming: bool,
     agent_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sessions_root = data_root.join("sessions");
-    let store = Arc::new(
-        tokio::task::spawn_blocking({
-            let sessions_root = sessions_root.clone();
-            move || JsonlEventStore::open(sessions_root)
-        })
-        .await??,
-    );
-    let provider: Arc<dyn zork_agent::session::runtime::ModelExecutor> = if fake_agent {
+    let store = Arc::new(StreamStore::open(&data_root)?);
+    let query = Arc::new(FileSessionQuery::open(&data_root));
+    let provider: Arc<dyn ModelExecutor> = if fake_agent {
         Arc::new(FakeProvider)
     } else {
         Arc::new(ProviderRouter::new())
     };
-    let tools = Arc::new(WorkspaceToolExecutor::new());
-    let clock = Arc::new(SystemClock);
-    let (due_tx, mut due_rx) = tokio::sync::mpsc::unbounded_channel::<TimerArm>();
-    let timer = Arc::new(SleepTimer::new(clock.clone(), due_tx));
     let profiles = Arc::new(ProfileStore::open(
         data_root.clone(),
         fake_agent,
         no_streaming,
     ));
-    let definition = AgentDefinition {
-        tools: coding_tool_names(),
-        tool_environment: session_tool_environment(&data_root, &file)?,
-    };
-    let runtime = Runtime::new_with_options(
-        store.clone(),
-        provider,
-        tools,
-        RuntimeOptions::defaults(),
-        clock,
-        timer.clone(),
-        profiles.clone(),
-        definition,
+    let model = Arc::new(AgentModelPort::new(provider, profiles.clone()));
+    let clock = Arc::new(SystemClock);
+    let ids = Arc::new(SystemIdGenerator);
+
+    let tools = Arc::new(ToolRegistry::default());
+    register_builtin_tools(
+        &tools,
+        BuiltinToolDependencies {
+            environment: session_tool_environment(&data_root, &file)?,
+            query: query.clone(),
+            clock: clock.clone(),
+            files: Arc::new(SystemFileSystem),
+            processes: Arc::new(SystemProcessSpawner),
+        },
+    )?;
+
+    let mut runner = ProfileStore::runner_options(&profiles);
+    runner.context = file.context.clone();
+
+    let service = SessionService::start(
+        ServiceDependencies {
+            store: store.clone(),
+            query,
+            model,
+            tools,
+            clock,
+            ids,
+        },
+        ServiceOptions {
+            runner,
+            ..ServiceOptions::default()
+        },
     );
-    let expire = runtime.clone();
-    tokio::spawn(async move {
-        while let Some(arm) = due_rx.recv().await {
-            expire.expire_wait(arm).await;
-        }
-    });
-    runtime.queue_startup_recovery().await?;
 
     let status_profiles = profiles.clone();
     tokio::spawn(async move {
@@ -123,7 +126,16 @@ async fn run(
         }
     });
 
-    let state = http::AppState::new(runtime.clone(), store, profiles, agent_token);
+    // ---- HTTP：唯一面（根路径）----
+    let state = http::AppState {
+        service: service.clone(),
+        profiles,
+        token: agent_token,
+    };
+    let router = Router::new()
+        .route("/readyz", get(readyz))
+        .merge(http::router(state));
+
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     println!("zork-agent ready http://{}", listener.local_addr()?);
     std::io::stdout().flush()?;
@@ -132,7 +144,7 @@ async fn run(
     let shutdown_signal = arm_shutdown_signal()?;
     tokio::pin!(shutdown_signal);
     let (shutdown, shutdown_requested) = tokio::sync::oneshot::channel::<()>();
-    let serving = axum::serve(listener, with_readyz(state))
+    let serving = axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = shutdown_requested.await;
         })
@@ -142,24 +154,17 @@ async fn run(
         result = &mut serving => result,
         () = &mut shutdown_signal => {
             let _ = shutdown.send(());
-            runtime.shutdown().await;
+            service.shutdown().await;
             match tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT, &mut serving).await {
                 Ok(result) => result,
                 Err(_) => Ok(()),
             }
         }
     };
-    runtime.shutdown().await;
-    timer.shutdown();
+    service.shutdown().await;
     zork_config::clear_ready_pid(&data_root, "zork-agent");
     result?;
     Ok(())
-}
-
-fn with_readyz(state: http::AppState) -> Router {
-    Router::new()
-        .route("/readyz", get(readyz))
-        .merge(http::router(state))
 }
 
 fn session_tool_environment(

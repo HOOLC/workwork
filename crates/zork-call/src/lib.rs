@@ -21,6 +21,8 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum Cli {
     #[command(subcommand)]
     Chat(ChatCmd),
+    #[command(subcommand)]
+    Slack(SlackCmd),
     Notify(NotifyCmd),
     #[command(subcommand)]
     Job(JobCmd),
@@ -48,6 +50,45 @@ pub enum ChatCmd {
     },
     #[command(name = "thread-history")]
     ThreadHistory {
+        #[arg(long = "before-message-id", conflicts_with = "before_cursor")]
+        before_message_id: Option<String>,
+        #[arg(long = "before-cursor")]
+        before_cursor: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        #[arg(long, value_parser = ["json", "text"])]
+        format: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SlackCmd {
+    #[command(name = "post-message")]
+    PostMessage {
+        #[arg(long = "channel-id")]
+        channel_id: String,
+        #[arg(long = "thread-ts")]
+        thread_ts: String,
+        #[arg(long)]
+        text: String,
+    },
+    #[command(name = "post-file")]
+    PostFile {
+        #[arg(long = "channel-id")]
+        channel_id: String,
+        #[arg(long = "thread-ts")]
+        thread_ts: String,
+        #[arg(long = "file-path")]
+        file_path: String,
+        #[arg(long = "initial-comment")]
+        initial_comment: Option<String>,
+    },
+    #[command(name = "thread-history")]
+    ThreadHistory {
+        #[arg(long = "channel-id")]
+        channel_id: String,
+        #[arg(long = "thread-ts")]
+        thread_ts: String,
         #[arg(long = "before-message-id", conflicts_with = "before_cursor")]
         before_message_id: Option<String>,
         #[arg(long = "before-cursor")]
@@ -118,9 +159,92 @@ impl MessageKind {
 pub fn run(cli: Cli) -> Result<()> {
     match cli {
         Cli::Chat(cmd) => run_chat(cmd),
+        Cli::Slack(cmd) => run_slack(cmd),
         Cli::Notify(cmd) => run_notify(cmd),
         Cli::Job(cmd) => run_job(cmd),
         Cli::Integration(cmd) => run_integration(cmd),
+    }
+}
+
+fn run_slack(cmd: SlackCmd) -> Result<()> {
+    let context = resolve_session_context()?;
+    if context.platform != "slack" {
+        bail!("the current session is not bound to Slack");
+    }
+    match cmd {
+        SlackCmd::PostMessage {
+            channel_id,
+            thread_ts,
+            text,
+        } => {
+            let (conversation_id, root_message_id) =
+                explicit_slack_coordinates(channel_id, thread_ts)?;
+            request_broker(
+                "POST",
+                "/chat/post-message",
+                None,
+                Some(json!({
+                    "platform": "slack",
+                    "sessionKey": context.session_key,
+                    "conversationId": conversation_id,
+                    "rootMessageId": root_message_id,
+                    "text": text,
+                })),
+            )
+        }
+        SlackCmd::PostFile {
+            channel_id,
+            thread_ts,
+            file_path,
+            initial_comment,
+        } => {
+            if !Path::new(&file_path).is_absolute() {
+                bail!("--file-path must be an absolute path");
+            }
+            let (conversation_id, root_message_id) =
+                explicit_slack_coordinates(channel_id, thread_ts)?;
+            let mut body = json!({
+                "platform": "slack",
+                "sessionKey": context.session_key,
+                "conversationId": conversation_id,
+                "rootMessageId": root_message_id,
+                "filePath": file_path,
+            });
+            if let Some(comment) = initial_comment {
+                body["initialComment"] = json!(comment);
+            }
+            request_broker("POST", "/chat/post-file", None, Some(body))
+        }
+        SlackCmd::ThreadHistory {
+            channel_id,
+            thread_ts,
+            before_message_id,
+            before_cursor,
+            limit,
+            format,
+        } => {
+            let (conversation_id, root_message_id) =
+                explicit_slack_coordinates(channel_id, thread_ts)?;
+            let mut query = vec![
+                ("platform", context.platform),
+                ("session_key", context.session_key),
+                ("conversation_id", conversation_id),
+                ("root_message_id", root_message_id),
+            ];
+            if let Some(value) = before_message_id {
+                query.push(("before_message_id", value));
+            }
+            if let Some(value) = before_cursor {
+                query.push(("before_cursor", value));
+            }
+            if let Some(value) = limit {
+                query.push(("limit", value.to_string()));
+            }
+            if let Some(value) = format {
+                query.push(("format", value));
+            }
+            request_broker("GET", "/chat/thread-history", Some(query), None)
+        }
     }
 }
 
@@ -154,6 +278,7 @@ fn run_chat(cmd: ChatCmd) -> Result<()> {
             let coords = resolve_chat_coordinates()?;
             let mut body = json!({
                 "platform": coords.platform,
+                "sessionKey": coords.session_key,
                 "conversationId": coords.conversation_id,
                 "rootMessageId": coords.root_message_id,
                 "text": text,
@@ -174,6 +299,7 @@ fn run_chat(cmd: ChatCmd) -> Result<()> {
             let coords = resolve_chat_coordinates()?;
             let mut body = json!({
                 "platform": coords.platform,
+                "sessionKey": coords.session_key,
                 "conversationId": coords.conversation_id,
                 "rootMessageId": coords.root_message_id,
                 "filePath": file_path,
@@ -192,6 +318,7 @@ fn run_chat(cmd: ChatCmd) -> Result<()> {
             let coords = resolve_chat_coordinates()?;
             let mut query = vec![
                 ("platform", coords.platform),
+                ("session_key", coords.session_key),
                 ("conversation_id", coords.conversation_id),
                 ("root_message_id", coords.root_message_id),
             ];
@@ -215,8 +342,7 @@ fn run_chat(cmd: ChatCmd) -> Result<()> {
 fn run_notify(cmd: NotifyCmd) -> Result<()> {
     let coords = resolve_chat_coordinates()?;
     let mut body = json!({
-        "conversationId": coords.conversation_id,
-        "rootMessageId": coords.root_message_id,
+        "sessionKey": coords.session_key,
         "text": cmd.text,
     });
     if let Some(job_id) = read_env("BROKER_JOB_ID") {
@@ -234,8 +360,7 @@ fn run_job(cmd: JobCmd) -> Result<()> {
     } = cmd;
     let coords = resolve_chat_coordinates()?;
     let mut body = json!({
-        "conversationId": coords.conversation_id,
-        "rootMessageId": coords.root_message_id,
+        "sessionKey": coords.session_key,
         "kind": kind,
         "script": script,
     });
@@ -288,33 +413,79 @@ fn parse_arguments_object(value: Option<&str>) -> Result<Map<String, Value>> {
 }
 
 fn resolve_chat_coordinates() -> Result<ChatCoordinates> {
-    let platform = read_env("CHAT_PLATFORM");
-    let conversation_id = read_env("CHAT_CONVERSATION_ID");
-    let root_message_id = read_env("CHAT_ROOT_MESSAGE_ID");
-    if let (Some(conversation_id), Some(root_message_id)) = (conversation_id, root_message_id) {
-        if let Some(platform) = platform.as_deref() {
-            if platform != "slack" {
-                bail!("invalid CHAT_PLATFORM: {platform}");
-            }
-        }
-        return Ok(ChatCoordinates {
-            platform: "slack".into(),
-            conversation_id,
-            root_message_id,
-        });
-    }
-    let cwd = env::current_dir().context("cwd")?;
-    lookup_thread_coordinates(&cwd.to_string_lossy())
+    let context = resolve_session_context()?;
+    let (Some(conversation_id), Some(root_message_id)) =
+        (context.conversation_id, context.root_message_id)
+    else {
+        bail!("the current proactive session requires explicit IM destination coordinates");
+    };
+    Ok(ChatCoordinates {
+        platform: context.platform,
+        session_key: context.session_key,
+        conversation_id,
+        root_message_id,
+    })
 }
 
 struct ChatCoordinates {
     platform: String,
+    session_key: String,
     conversation_id: String,
     root_message_id: String,
 }
 
-fn lookup_thread_coordinates(cwd: &str) -> Result<ChatCoordinates> {
+fn explicit_slack_coordinates(
+    conversation_id: String,
+    root_message_id: String,
+) -> Result<(String, String)> {
+    if conversation_id.trim().is_empty() {
+        bail!("--channel-id must not be empty");
+    }
+    if root_message_id.trim().is_empty() {
+        bail!("--thread-ts must not be empty");
+    }
+    Ok((conversation_id, root_message_id))
+}
+
+struct SessionContext {
+    platform: String,
+    #[allow(dead_code)]
+    connection_id: String,
+    session_key: String,
+    conversation_id: Option<String>,
+    root_message_id: Option<String>,
+}
+
+fn resolve_session_context() -> Result<SessionContext> {
+    if let (Some(session_key), Some(platform)) =
+        (read_env("SESSION_KEY"), read_env("CHAT_PLATFORM"))
+    {
+        return Ok(SessionContext {
+            platform,
+            connection_id: read_env("CHAT_CONNECTION_ID").unwrap_or_default(),
+            session_key,
+            conversation_id: read_env("CHAT_CONVERSATION_ID"),
+            root_message_id: read_env("CHAT_ROOT_MESSAGE_ID"),
+        });
+    }
+    if let Some(agent_session_id) = read_env("ZORK_AGENT_SESSION_ID") {
+        return lookup_session_context_by_agent_session(&agent_session_id);
+    }
+    let cwd = env::current_dir().context("cwd")?;
+    lookup_session_context(&cwd.to_string_lossy())
+}
+
+fn lookup_session_context_by_agent_session(agent_session_id: &str) -> Result<SessionContext> {
+    let query = vec![("threadId", agent_session_id.to_owned())];
+    fetch_session_context(query)
+}
+
+fn lookup_session_context(cwd: &str) -> Result<SessionContext> {
     let query = vec![("cwd", cwd.to_string())];
+    fetch_session_context(query)
+}
+
+fn fetch_session_context(query: Vec<(&str, String)>) -> Result<SessionContext> {
     let result = fetch_broker("GET", "/cli/context", Some(query), None)?;
     if !result.ok {
         bail!(
@@ -336,11 +507,16 @@ fn lookup_thread_coordinates(cwd: &str) -> Result<ChatCoordinates> {
         &payload,
         &["rootMessageId", "root_message_id", "rootThreadTs"],
     );
-    let (Some(conversation_id), Some(root_message_id)) = (conversation_id, root_message_id) else {
-        bail!("cli context is missing conversation coordinates");
-    };
-    Ok(ChatCoordinates {
-        platform: "slack".into(),
+    let platform = read_json_string(&payload, &["platform"])
+        .ok_or_else(|| anyhow::anyhow!("cli context is missing platform"))?;
+    let connection_id = read_json_string(&payload, &["connectionId", "connection_id"])
+        .ok_or_else(|| anyhow::anyhow!("cli context is missing connection ID"))?;
+    let session_key = read_json_string(&payload, &["sessionKey", "session_key"])
+        .ok_or_else(|| anyhow::anyhow!("cli context is missing session key"))?;
+    Ok(SessionContext {
+        platform,
+        connection_id,
+        session_key,
         conversation_id,
         root_message_id,
     })
@@ -424,7 +600,7 @@ fn resolve_github_token(
     argv: &[String],
 ) -> Result<std::result::Result<String, String>> {
     let url = Url::parse(&format!(
-        "{}/slack/github-token/resolve",
+        "{}/github-token/resolve",
         broker_api_base.trim_end_matches('/')
     ))
     .context("BROKER_API_BASE")?;

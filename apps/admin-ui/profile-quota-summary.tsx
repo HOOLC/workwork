@@ -12,6 +12,9 @@ export function ProfileQuotaMetrics({ quota }: { readonly quota: ProfileQuotaSum
   if (quota.ok === false) {
     return <div className="profile-quota-error">{quota.error}</div>;
   }
+  if (quota.reported === false) {
+    return <div className="profile-quota-unreported">{quota.label}</div>;
+  }
   return (
     <div className="profile-quota-block" title={quota.fullLabel}>
       <div className="profile-quota-metrics">
@@ -41,6 +44,7 @@ export function ProfileQuotaMetrics({ quota }: { readonly quota: ProfileQuotaSum
 export type ProfileQuotaSummary =
   | {
       readonly ok: true;
+      readonly reported: true;
       readonly fullLabel: string;
       readonly remainingCaption: string;
       readonly remainingLabel: string;
@@ -51,6 +55,12 @@ export type ProfileQuotaSummary =
       readonly tone: Tone;
     }
   | {
+      readonly ok: true;
+      readonly reported: false;
+      readonly label: string;
+      readonly tone: Tone;
+    }
+  | {
       readonly ok: false;
       readonly error: string;
       readonly tone: Tone;
@@ -58,7 +68,7 @@ export type ProfileQuotaSummary =
 
 export function profileQuotaSummary(profile: any): ProfileQuotaSummary {
   const rateLimits = profile?.rateLimits ?? profile;
-  if (!rateLimits || rateLimits.ok === false) {
+  if (rateLimits?.ok === false) {
     return {
       ok: false,
       error: rateLimits?.error || "额度不可用",
@@ -68,9 +78,18 @@ export function profileQuotaSummary(profile: any): ProfileQuotaSummary {
 
   if (profile?.billing === "usage") {
     const remaining = usageRemainingOf(profile);
-    const remainingLabel = remaining === undefined ? "--" : remaining === Number.POSITIVE_INFINITY ? "无限" : `$${formatUsageBalance(remaining)}`;
+    if (remaining === undefined) {
+      return {
+        ok: true,
+        reported: false,
+        label: "未提供额度信息",
+        tone: "",
+      };
+    }
+    const remainingLabel = remaining === Number.POSITIVE_INFINITY ? "无限" : `$${formatUsageBalance(remaining)}`;
     return {
       ok: true,
+      reported: true,
       fullLabel: profileQuotaLabel(profile),
       remainingCaption: "余额",
       remainingLabel,
@@ -92,6 +111,7 @@ export function profileQuotaSummary(profile: any): ProfileQuotaSummary {
   const score = weightedWeeklyQuotaScore(remaining, daysUntilReset(weekly?.resetsAt));
   return {
     ok: true,
+    reported: true,
     fullLabel: display.fullLabel || "额度未知",
     remainingCaption: "7d 剩余",
     remainingLabel: remaining === undefined ? "--" : `${Math.round(remaining)}%`,

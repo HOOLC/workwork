@@ -48,6 +48,8 @@ export function renderSessionMeta(session: SessionRecord, channelLabelById?: Rea
   const selectionBlocked = sessionSelectionBlocked(session);
   return [
     platformPill(session),
+    connectionPill(session),
+    modePill(session),
     {
       key: "channel",
       label: resolveSessionChannelLabel(session, channelLabelById),
@@ -80,6 +82,28 @@ export function renderSessionMeta(session: SessionRecord, channelLabelById?: Rea
       : null,
     activeJobCount > 0 ? { key: "jobs", label: "Jobs " + activeJobCount, tone: "good" } : null,
   ].filter((item): item is SessionMetaPill => Boolean(item));
+}
+
+function connectionPill(session: SessionRecord): SessionMetaPill | null {
+  const connectionId = String(session.connectionId || "").trim();
+  const connectionName = String(session.connectionName || connectionId).trim();
+  if (!connectionName) return null;
+  return {
+    key: "connection",
+    label: connectionName,
+    tone: "purple",
+    title: connectionId ? `IM 接入 ${connectionId}` : "IM 接入",
+  };
+}
+
+function modePill(session: SessionRecord): SessionMetaPill {
+  const proactive = String(session.mode || "normal") === "proactive";
+  return {
+    key: "mode",
+    label: proactive ? "主动" : "普通",
+    tone: proactive ? "warn" : "",
+    title: proactive ? "该接入的所有消息进入同一个 Agent Session" : "每个远端对话使用独立 Agent Session",
+  };
 }
 
 export function sessionOperationalState(session: SessionRecord): SessionOperationalState {

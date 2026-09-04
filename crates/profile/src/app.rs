@@ -66,10 +66,24 @@ impl ModelApi {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelLimits {
     pub context_window_tokens: u64,
     pub max_output_tokens: u32,
+    /// 输入预算预留百分比（0–100，千分之一精度可选）。预留 =
+    /// max(max_output_tokens, window × pct%)。缺省 10。
+    #[serde(
+        default = "default_reserve_percent",
+        skip_serializing_if = "is_default_reserve_percent"
+    )]
+    pub reserve_percent: u64,
+}
+
+fn default_reserve_percent() -> u64 {
+    10
+}
+
+fn is_default_reserve_percent(value: &u64) -> bool {
+    *value == 10
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,7 +92,8 @@ pub struct ModelCapabilities {
     pub input: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileView {
     pub profile_id: String,
     pub provider: String,
@@ -557,6 +572,53 @@ mod tests {
                 validate(&document).unwrap();
             }
         }
+    }
+
+    #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-03]
+    fn every_provider_default_limit_policy_is_table_driven() {
+        let mut actual = Vec::new();
+        for provider in providers::all() {
+            for billing in provider.info().billing {
+                let template = provider.template(billing.id).unwrap();
+                let document: ProfileDocument =
+                    serde_json::from_value(template.document(json!({}))).unwrap();
+                let model = document
+                    .models
+                    .iter()
+                    .find(|model| model.default)
+                    .expect("every built-in template declares one default model");
+                actual.push((
+                    provider.info().id,
+                    billing.id,
+                    model
+                        .limits
+                        .as_ref()
+                        .map(|limits| (limits.context_window_tokens, limits.max_output_tokens)),
+                ));
+            }
+        }
+        actual.sort_unstable();
+
+        // None means the provider must be configured explicitly before use.
+        assert_eq!(
+            actual,
+            vec![
+                ("anthropic", "subscription", Some((1_000_000, 128_000))),
+                ("anthropic", "usage", Some((1_000_000, 128_000))),
+                ("github-copilot", "subscription", Some((1_047_576, 32_768))),
+                ("github-copilot", "usage", Some((1_047_576, 32_768))),
+                ("kimi-coding", "subscription", None),
+                ("kimi-coding", "usage", None),
+                ("openai", "subscription", Some((872_000, 128_000))),
+                ("openai", "usage", Some((1_047_576, 32_768))),
+                ("openai-compatible", "usage", None),
+                ("opencode-go", "subscription", Some((1_048_576, 131_072))),
+                ("openrouter", "usage", None),
+                ("xai", "subscription", Some((500_000, 8_192))),
+                ("xai", "usage", Some((500_000, 8_192))),
+            ]
+        );
     }
 
     #[test]

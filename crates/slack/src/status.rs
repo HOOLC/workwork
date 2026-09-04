@@ -63,18 +63,11 @@ impl AssistantStatusHub {
         }
     }
 
-    pub async fn clear(&self, session_key: &str) {
-        let (channel_id, thread_ts) = split_session_key(session_key);
-        self.set_thread(&channel_id, &thread_ts, "").await;
+    pub async fn clear_thread(&self, channel_id: &str, thread_ts: &str) {
+        self.set_thread(channel_id, thread_ts, "").await;
     }
 
-    /// Status keyed by session key (channel:thread).
-    pub async fn set(&self, session_key: &str, status: &str) {
-        let (channel_id, thread_ts) = split_session_key(session_key);
-        self.set_thread(&channel_id, &thread_ts, status).await;
-    }
-
-    async fn set_thread(&self, channel_id: &str, thread_ts: &str, status: &str) {
+    pub async fn set_thread(&self, channel_id: &str, thread_ts: &str, status: &str) {
         if channel_id.is_empty() || thread_ts.is_empty() {
             return;
         }
@@ -313,11 +306,4 @@ fn urlencode(value: &str) -> String {
         }
     }
     out
-}
-
-fn split_session_key(session_key: &str) -> (String, String) {
-    match session_key.split_once(':') {
-        Some((channel, thread)) => (channel.to_string(), thread.to_string()),
-        None => (session_key.to_string(), String::new()),
-    }
 }

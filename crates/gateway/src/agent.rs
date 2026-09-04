@@ -1,54 +1,33 @@
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::collections::HashMap;
+use zork_agent_api::{
+    ApiErrorBody, ApiErrorCode, CreateSessionRequest, ItemList, MailboxRequest, ProfileDocument,
+    SessionSummary, SessionView,
+};
+
+pub use zork_agent_api::{AgentProfile, SessionSelection};
+
+#[cfg(test)]
+use serde_json::json;
 
 use crate::config::RuntimeConfig;
-use crate::db::{GatewayDb, SessionRow};
+use crate::db::{GatewayDb, ProactiveBindingRow, SessionBindingRow, SessionRow};
 
-const SLACK_SYSTEM_PROMPT: &str = include_str!("../prompts/slack-thread-base-instructions.md");
+const IM_SYSTEM_PROMPT: &str = include_str!("../prompts/im-thread-base-instructions.md");
+const SLACK_PROACTIVE_SYSTEM_PROMPT: &str =
+    include_str!("../prompts/slack-proactive-base-instructions.md");
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct AgentProfile {
-    pub profile_id: String,
-    #[serde(default)]
-    pub billing: String,
-    pub auth_configured: bool,
-    #[serde(default)]
-    pub account: Value,
-    #[serde(default, rename = "rateLimits")]
-    pub rate_limits: Value,
-    pub models: Vec<AgentModel>,
+pub fn system_prompt_for_binding(binding: &SessionBindingRow) -> &'static str {
+    match binding {
+        SessionBindingRow::Normal(_) => IM_SYSTEM_PROMPT,
+        SessionBindingRow::Proactive(_) => SLACK_PROACTIVE_SYSTEM_PROMPT,
+    }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct AgentModel {
-    pub id: String,
-    pub thinking: Vec<String>,
-    pub default_thinking: String,
-    pub default: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SessionSelection {
-    pub profile_id: String,
-    pub model: String,
-    pub thinking: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProfileList {
-    items: Vec<AgentProfile>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreatedSession {
-    pub session_id: String,
-    pub workspace: String,
-    profile_id: String,
-    model: String,
-    thinking: String,
-}
+pub type CreatedSession = SessionView;
 
 #[derive(Debug)]
 pub struct AgentHttpError {
@@ -80,24 +59,33 @@ pub fn authenticate(
 
 pub async fn list_profiles(config: &RuntimeConfig) -> Result<Vec<AgentProfile>> {
     let http = client()?;
+    let response = authenticate(config, http.get(format!("{}/profiles", base_url(config))))
+        .send()
+        .await
+        .context("list zork-agent profiles")?;
+    let list: ItemList<AgentProfile> = response_json(response, "list zork-agent profiles").await?;
+    Ok(list.items)
+}
+
+pub async fn profile_list_value(config: &RuntimeConfig) -> Result<Value> {
+    profiles_value(config).await
+}
+
+pub async fn session_statuses(config: &RuntimeConfig) -> Result<HashMap<String, String>> {
     let response = authenticate(
         config,
-        http.get(format!("{}/v1/profiles", base_url(config))),
+        client()?.get(format!("{}/sessions", base_url(config))),
     )
     .send()
     .await
-    .context("list zork-agent profiles")?;
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(json!({}));
-    if !status.is_success() {
-        anyhow::bail!(
-            "zork-agent profile list failed: {}",
-            api_error_message(&body).unwrap_or_else(|| status.to_string())
-        );
-    }
-    let list: ProfileList =
-        serde_json::from_value(body).context("invalid zork-agent profile list")?;
-    Ok(list.items)
+    .context("list zork-agent sessions")?;
+    let list: ItemList<SessionSummary> =
+        response_json(response, "list zork-agent sessions").await?;
+    Ok(list
+        .items
+        .into_iter()
+        .map(|session| (session.session_id, session.status.as_str().to_owned()))
+        .collect())
 }
 
 pub fn default_selection(profiles: &[AgentProfile]) -> Option<SessionSelection> {
@@ -158,26 +146,43 @@ pub async fn ensure_session(
     db: &GatewayDb,
     session: &SessionRow,
 ) -> Result<String> {
-    if let Some(session_id) = &session.id {
-        return Ok(session_id.clone());
+    ensure_binding_session(config, db, &SessionBindingRow::Normal(session.clone())).await
+}
+
+pub async fn ensure_proactive_session(
+    config: &RuntimeConfig,
+    db: &GatewayDb,
+    binding: &ProactiveBindingRow,
+) -> Result<String> {
+    ensure_binding_session(config, db, &SessionBindingRow::Proactive(binding.clone())).await
+}
+
+pub async fn ensure_binding_session(
+    config: &RuntimeConfig,
+    db: &GatewayDb,
+    binding: &SessionBindingRow,
+) -> Result<String> {
+    if let Some(session_id) = binding.id() {
+        return Ok(session_id.to_owned());
     }
     let profiles = list_profiles(config).await?;
     let selection = match default_selection(&profiles) {
         Some(selection) => selection,
         None => {
-            db.set_selection_block(&session.key, "no_selectable_profiles")?;
+            db.set_binding_selection_block(binding, "no_selectable_profiles")?;
             anyhow::bail!("no selectable Agent profiles");
         }
     };
+    let system_prompt = system_prompt_for_binding(binding);
     let created = create_session(
         config,
         &selection,
-        Some(SLACK_SYSTEM_PROMPT),
-        &session.workspace_path,
+        Some(system_prompt),
+        binding.workspace_path(),
     )
     .await?;
-    db.set_agent_session(
-        &session.key,
+    db.set_binding_agent_session(
+        binding,
         &created.session_id,
         &created.workspace,
         &selection.profile_id,
@@ -185,6 +190,40 @@ pub async fn ensure_session(
         &selection.thinking,
     )?;
     Ok(created.session_id)
+}
+
+pub async fn create_binding_session(
+    config: &RuntimeConfig,
+    db: &GatewayDb,
+    binding: &SessionBindingRow,
+    selection: &SessionSelection,
+) -> std::result::Result<CreatedSession, AgentHttpError> {
+    if binding.id().is_some() {
+        return Err(AgentHttpError {
+            status: StatusCode::CONFLICT,
+            message: "binding already has an Agent session".to_owned(),
+        });
+    }
+    let created = create_session(
+        config,
+        selection,
+        Some(system_prompt_for_binding(binding)),
+        binding.workspace_path(),
+    )
+    .await?;
+    db.set_binding_agent_session(
+        binding,
+        &created.session_id,
+        &created.workspace,
+        &created.profile_id,
+        &created.model,
+        &created.thinking,
+    )
+    .map_err(|error| AgentHttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("persist Agent binding: {error}"),
+    })?;
+    Ok(created)
 }
 
 pub async fn create_session(
@@ -197,39 +236,24 @@ pub async fn create_session(
         status: StatusCode::BAD_GATEWAY,
         message: error.to_string(),
     })?;
-    let response = authenticate(
-        config,
-        http.post(format!("{}/v1/sessions", base_url(config))),
-    )
-    .json(&json!({
-        "profile_id": selection.profile_id,
-        "model": selection.model,
-        "thinking": selection.thinking,
-        "system_prompt": system_prompt,
-        "workspace": workspace,
-    }))
-    .send()
-    .await
-    .map_err(|error| AgentHttpError {
-        status: StatusCode::BAD_GATEWAY,
-        message: format!("create zork-agent session: {error}"),
-    })?;
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(json!({}));
-    if status != StatusCode::CREATED {
-        return Err(AgentHttpError {
-            status: if status.is_client_error() {
-                status
-            } else {
-                StatusCode::BAD_GATEWAY
-            },
-            message: api_error_message(&body).unwrap_or_else(|| status.to_string()),
-        });
-    }
-    let created: CreatedSession = serde_json::from_value(body).map_err(|error| AgentHttpError {
-        status: StatusCode::BAD_GATEWAY,
-        message: format!("invalid zork-agent session response: {error}"),
-    })?;
+    let response = authenticate(config, http.post(format!("{}/sessions", base_url(config))))
+        .json(&CreateSessionRequest {
+            context: None,
+            profile_id: selection.profile_id.clone(),
+            model: selection.model.clone(),
+            thinking: selection.thinking.clone(),
+            system_prompt: system_prompt.map(str::to_owned),
+            workspace: Some(workspace.to_owned()),
+        })
+        .send()
+        .await
+        .map_err(|error| AgentHttpError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("create zork-agent session: {error}"),
+        })?;
+    let created: CreatedSession =
+        response_json_with_status(response, StatusCode::CREATED, "create zork-agent session")
+            .await?;
     if created.profile_id != selection.profile_id
         || created.model != selection.model
         || created.thinking != selection.thinking
@@ -253,55 +277,70 @@ pub async fn update_selection(
     session_id: &str,
     selection: &SessionSelection,
 ) -> std::result::Result<SessionSelection, AgentHttpError> {
+    // PUT /sessions/{id}/selection —— 事实事件，下一轮生效。
     let http = client().map_err(|error| AgentHttpError {
         status: StatusCode::BAD_GATEWAY,
         message: error.to_string(),
     })?;
-    let response = authenticate(
-        config,
-        http.put(format!(
-            "{}/v1/sessions/{session_id}/selection",
+    let request = http
+        .put(format!(
+            "{}/sessions/{session_id}/selection",
             base_url(config)
-        )),
-    )
-    .json(selection)
-    .send()
-    .await
-    .map_err(|error| AgentHttpError {
-        status: StatusCode::BAD_GATEWAY,
-        message: format!("update zork-agent session selection: {error}"),
-    })?;
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(json!({}));
-    if !status.is_success() {
-        return Err(AgentHttpError {
-            status: if status.is_client_error() {
-                status
-            } else {
-                StatusCode::BAD_GATEWAY
-            },
-            message: api_error_message(&body).unwrap_or_else(|| status.to_string()),
-        });
-    }
-    let updated: CreatedSession = serde_json::from_value(body).map_err(|error| AgentHttpError {
-        status: StatusCode::BAD_GATEWAY,
-        message: format!("invalid zork-agent session response: {error}"),
-    })?;
-    if updated.session_id != session_id
-        || updated.profile_id != selection.profile_id
-        || updated.model != selection.model
-        || updated.thinking != selection.thinking
-    {
+        ))
+        .json(selection);
+    let response = authenticate(config, request)
+        .send()
+        .await
+        .map_err(|error| AgentHttpError {
+            status: StatusCode::BAD_GATEWAY,
+            message: error.to_string(),
+        })?;
+    let session: SessionView =
+        response_json_with_status(response, StatusCode::OK, "update zork-agent selection").await?;
+    let updated = session.selection();
+    if session.session_id != session_id || &updated != selection {
         return Err(AgentHttpError {
             status: StatusCode::BAD_GATEWAY,
             message: "zork-agent returned a different session selection".to_owned(),
         });
     }
-    Ok(SessionSelection {
-        profile_id: updated.profile_id,
-        model: updated.model,
-        thinking: updated.thinking,
-    })
+    Ok(updated)
+}
+
+/// Context policy lives only in Agent state; the Gateway does not cache or
+/// independently persist a second copy.
+pub async fn session_context(
+    config: &RuntimeConfig,
+    session_id: &str,
+    update: Option<&zork_agent_api::ContextConfig>,
+) -> std::result::Result<zork_agent_api::ContextConfig, AgentHttpError> {
+    let http = client().map_err(|error| AgentHttpError {
+        status: StatusCode::BAD_GATEWAY,
+        message: error.to_string(),
+    })?;
+    let url = format!("{}/sessions/{session_id}", base_url(config));
+    let request = match update {
+        Some(context) => http.put(format!("{url}/context")).json(context),
+        None => http.get(url),
+    };
+    let response = authenticate(config, request)
+        .send()
+        .await
+        .map_err(|error| AgentHttpError {
+            status: StatusCode::BAD_GATEWAY,
+            message: error.to_string(),
+        })?;
+    let session: SessionView =
+        response_json_with_status(response, StatusCode::OK, "session context").await?;
+    if session.session_id != session_id
+        || update.is_some_and(|expected| expected != &session.context)
+    {
+        return Err(AgentHttpError {
+            status: StatusCode::BAD_GATEWAY,
+            message: "zork-agent returned a different session context".into(),
+        });
+    }
+    Ok(session.context)
 }
 
 pub async fn append_mailbox(config: &RuntimeConfig, session_id: &str, content: &str) -> Result<()> {
@@ -309,46 +348,47 @@ pub async fn append_mailbox(config: &RuntimeConfig, session_id: &str, content: &
     let response = authenticate(
         config,
         http.post(format!(
-            "{}/v1/sessions/{session_id}/mailbox",
+            "{}/sessions/{session_id}/mailbox",
             base_url(config)
         )),
     )
-    .json(&json!({ "content": content }))
+    .json(&MailboxRequest {
+        content: content.to_owned(),
+    })
     .send()
     .await
     .context("append zork-agent mailbox")?;
-    if response.status() != StatusCode::ACCEPTED {
-        let status = response.status();
-        let body: Value = response.json().await.unwrap_or(json!({}));
-        anyhow::bail!(
-            "zork-agent mailbox append failed: {}",
-            api_error_message(&body).unwrap_or_else(|| status.to_string())
-        );
-    }
-    Ok(())
+    response_empty(response, StatusCode::ACCEPTED, "append zork-agent mailbox").await
 }
 
 pub async fn cancel_session(config: &RuntimeConfig, session_id: &str) -> Result<bool> {
     let response = authenticate(
         config,
-        client()?.post(format!(
-            "{}/v1/sessions/{session_id}/cancel",
-            base_url(config)
-        )),
+        client()?.post(format!("{}/sessions/{session_id}/cancel", base_url(config))),
     )
     .send()
     .await
     .context("cancel zork-agent session")?;
-    match response.status() {
+    let status = response.status();
+    match status {
         StatusCode::NO_CONTENT => Ok(true),
-        StatusCode::NOT_FOUND => Ok(false),
-        status => {
-            let body: Value = response.json().await.unwrap_or(json!({}));
-            anyhow::bail!(
-                "zork-agent cancellation failed: {}",
-                api_error_message(&body).unwrap_or_else(|| status.to_string())
-            )
+        StatusCode::NOT_FOUND => {
+            let error = decode_error_response(response, "cancel zork-agent session").await?;
+            if error.error.code != ApiErrorCode::SessionNotFound {
+                anyhow::bail!(
+                    "cancel zork-agent session returned HTTP 404 with error code {:?}",
+                    error.error.code
+                );
+            }
+            Ok(false)
         }
+        _ => Err(anyhow::anyhow!(
+            "zork-agent cancellation failed: {}",
+            decode_error_response(response, "cancel zork-agent session")
+                .await?
+                .error
+                .message
+        )),
     }
 }
 
@@ -357,22 +397,32 @@ pub async fn put_profile(
     profile_id: &str,
     document: &Value,
 ) -> std::result::Result<Value, AgentHttpError> {
+    let document: ProfileDocument =
+        serde_json::from_value(document.clone()).map_err(|error| AgentHttpError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("invalid zork-agent profile document: {error}"),
+        })?;
     let http = client().map_err(|error| AgentHttpError {
         status: StatusCode::BAD_GATEWAY,
         message: error.to_string(),
     })?;
     let response = authenticate(
         config,
-        http.put(format!("{}/v1/profiles/{profile_id}", base_url(config))),
+        http.put(format!("{}/profiles/{profile_id}", base_url(config))),
     )
-    .json(document)
+    .json(&document)
     .send()
     .await
     .map_err(|error| AgentHttpError {
         status: StatusCode::BAD_GATEWAY,
         message: format!("put zork-agent profile: {error}"),
     })?;
-    response_value_with_status(response).await
+    let profile: AgentProfile =
+        response_json_with_status(response, StatusCode::OK, "put zork-agent profile").await?;
+    serde_json::to_value(profile).map_err(|error| AgentHttpError {
+        status: StatusCode::BAD_GATEWAY,
+        message: format!("encode zork-agent profile response: {error}"),
+    })
 }
 
 pub async fn delete_profile(
@@ -385,7 +435,7 @@ pub async fn delete_profile(
     })?;
     let response = authenticate(
         config,
-        http.delete(format!("{}/v1/profiles/{profile_id}", base_url(config))),
+        http.delete(format!("{}/profiles/{profile_id}", base_url(config))),
     )
     .send()
     .await
@@ -393,60 +443,25 @@ pub async fn delete_profile(
         status: StatusCode::BAD_GATEWAY,
         message: format!("delete zork-agent profile: {error}"),
     })?;
-    if response.status() != StatusCode::NO_CONTENT {
-        let status = response.status();
-        let body: Value = response.json().await.unwrap_or(json!({}));
-        return Err(AgentHttpError {
-            status: if status.is_client_error() {
-                status
-            } else {
-                StatusCode::BAD_GATEWAY
-            },
-            message: api_error_message(&body).unwrap_or_else(|| status.to_string()),
-        });
-    }
-    Ok(())
+    response_empty_with_status(
+        response,
+        StatusCode::NO_CONTENT,
+        "delete zork-agent profile",
+    )
+    .await
 }
 
 pub async fn profiles_value(config: &RuntimeConfig) -> Result<Value> {
     let response = authenticate(
         config,
-        client()?.get(format!("{}/v1/profiles", base_url(config))),
+        client()?.get(format!("{}/profiles", base_url(config))),
     )
     .send()
     .await
     .context("list zork-agent profiles")?;
-    response_value(response, "list zork-agent profiles").await
-}
-
-async fn response_value(response: reqwest::Response, operation: &str) -> Result<Value> {
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(json!({}));
-    if !status.is_success() {
-        anyhow::bail!(
-            "{operation} failed: {}",
-            api_error_message(&body).unwrap_or_else(|| status.to_string())
-        );
-    }
-    Ok(body)
-}
-
-async fn response_value_with_status(
-    response: reqwest::Response,
-) -> std::result::Result<Value, AgentHttpError> {
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(json!({}));
-    if !status.is_success() {
-        return Err(AgentHttpError {
-            status: if status.is_client_error() {
-                status
-            } else {
-                StatusCode::BAD_GATEWAY
-            },
-            message: api_error_message(&body).unwrap_or_else(|| status.to_string()),
-        });
-    }
-    Ok(body)
+    let profiles: ItemList<AgentProfile> =
+        response_json(response, "list zork-agent profiles").await?;
+    serde_json::to_value(profiles).context("encode zork-agent profile list")
 }
 
 fn client() -> Result<Client> {
@@ -456,11 +471,83 @@ fn client() -> Result<Client> {
         .context("Agent HTTP client")
 }
 
-fn api_error_message(body: &Value) -> Option<String> {
-    body.get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+async fn response_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T> {
+    if !response.status().is_success() {
+        let error = decode_error_response(response, operation).await?;
+        anyhow::bail!("{operation} failed: {}", error.error.message);
+    }
+    response
+        .json::<T>()
+        .await
+        .with_context(|| format!("invalid {operation} response"))
+}
+
+async fn response_empty(
+    response: reqwest::Response,
+    expected: StatusCode,
+    operation: &str,
+) -> Result<()> {
+    if response.status() == expected {
+        return Ok(());
+    }
+    let error = decode_error_response(response, operation).await?;
+    anyhow::bail!("{operation} failed: {}", error.error.message)
+}
+
+async fn decode_error_response(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<ApiErrorBody> {
+    let status = response.status();
+    response
+        .json::<ApiErrorBody>()
+        .await
+        .with_context(|| format!("invalid {operation} error response for HTTP {status}"))
+}
+
+async fn response_json_with_status<T: DeserializeOwned>(
+    response: reqwest::Response,
+    expected: StatusCode,
+    operation: &str,
+) -> std::result::Result<T, AgentHttpError> {
+    if response.status() != expected {
+        return Err(agent_http_error(response, operation).await);
+    }
+    response.json::<T>().await.map_err(|error| AgentHttpError {
+        status: StatusCode::BAD_GATEWAY,
+        message: format!("invalid {operation} response: {error}"),
+    })
+}
+
+async fn response_empty_with_status(
+    response: reqwest::Response,
+    expected: StatusCode,
+    operation: &str,
+) -> std::result::Result<(), AgentHttpError> {
+    if response.status() == expected {
+        Ok(())
+    } else {
+        Err(agent_http_error(response, operation).await)
+    }
+}
+
+async fn agent_http_error(response: reqwest::Response, operation: &str) -> AgentHttpError {
+    let upstream_status = response.status();
+    let status = if upstream_status.is_client_error() {
+        upstream_status
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    let message = match response.json::<ApiErrorBody>().await {
+        Ok(error) => error.error.message,
+        Err(error) => {
+            format!("invalid {operation} error response for HTTP {upstream_status}: {error}")
+        }
+    };
+    AgentHttpError { status, message }
 }
 
 fn recommended_profile<'a>(profiles: &[&'a AgentProfile]) -> Option<&'a AgentProfile> {
@@ -533,21 +620,36 @@ fn remaining_score(profile: &AgentProfile) -> f64 {
 mod tests {
     use super::*;
 
+    fn profile(
+        profile_id: &str,
+        billing: &str,
+        account: Value,
+        rate_limits: Value,
+    ) -> AgentProfile {
+        serde_json::from_value(json!({
+            "profile_id": profile_id,
+            "provider": "test",
+            "billing": billing,
+            "auth_configured": true,
+            "account": account,
+            "rateLimits": rate_limits,
+            "models": [{
+                "id": "grok-4.6",
+                "api": "openai-responses",
+                "streaming": true,
+                "parallel_tool_calls": false,
+                "thinking": ["high", "xhigh"],
+                "default_thinking": "xhigh",
+                "capabilities": {"input": ["text"]},
+                "default": true
+            }]
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn selects_only_an_explicit_profile_default_model_and_thinking() {
-        let profiles = vec![AgentProfile {
-            profile_id: "grok".to_owned(),
-            billing: "subscription".to_owned(),
-            auth_configured: true,
-            account: json!({}),
-            rate_limits: json!({}),
-            models: vec![AgentModel {
-                id: "grok-4.6".to_owned(),
-                thinking: vec!["high".to_owned(), "xhigh".to_owned()],
-                default_thinking: "xhigh".to_owned(),
-                default: true,
-            }],
-        }];
+        let profiles = vec![profile("grok", "subscription", json!({}), json!({}))];
         assert_eq!(
             default_selection(&profiles),
             Some(SessionSelection {
@@ -560,29 +662,19 @@ mod tests {
 
     #[test]
     fn automatic_profile_keeps_the_requested_model_and_thinking() {
-        let models = vec![AgentModel {
-            id: "grok-4.6".to_owned(),
-            thinking: vec!["high".to_owned(), "xhigh".to_owned()],
-            default_thinking: "xhigh".to_owned(),
-            default: true,
-        }];
         let profiles = vec![
-            AgentProfile {
-                profile_id: "usage".to_owned(),
-                billing: "usage".to_owned(),
-                auth_configured: true,
-                account: json!({ "ok": true }),
-                rate_limits: json!({ "ok": true, "rateLimits": { "credits": { "balance": "100" } } }),
-                models: models.clone(),
-            },
-            AgentProfile {
-                profile_id: "subscription".to_owned(),
-                billing: "subscription".to_owned(),
-                auth_configured: true,
-                account: json!({ "ok": true }),
-                rate_limits: json!({ "ok": true, "rateLimits": { "secondary": { "usedPercent": 60 } } }),
-                models,
-            },
+            profile(
+                "usage",
+                "usage",
+                json!({ "ok": true }),
+                json!({ "ok": true, "rateLimits": { "credits": { "balance": "100" } } }),
+            ),
+            profile(
+                "subscription",
+                "subscription",
+                json!({ "ok": true }),
+                json!({ "ok": true, "rateLimits": { "secondary": { "usedPercent": 60 } } }),
+            ),
         ];
         assert_eq!(
             resolve_selection(

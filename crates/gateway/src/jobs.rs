@@ -18,8 +18,7 @@ const MAX_RUNTIME_MS: u64 = 12 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct JobEvent {
-    pub conversation_id: String,
-    pub root_message_id: String,
+    pub session_key: String,
     pub job_id: String,
     pub kind: String,
     pub event_kind: String,
@@ -59,18 +58,17 @@ impl JobSupervisor {
     #[allow(clippy::too_many_arguments)]
     pub async fn register(
         self: &Arc<Self>,
-        conversation_id: &str,
-        root_message_id: &str,
+        session_key: &str,
         kind: &str,
         script: &str,
         cwd: Option<&str>,
         shell: Option<&str>,
         restart_on_boot: bool,
     ) -> Result<JobRow> {
-        let session = self
+        let binding = self
             .db
-            .get_session(&format!("{conversation_id}:{root_message_id}"))?
-            .with_context(|| format!("Unknown session: {conversation_id}:{root_message_id}"))?;
+            .get_binding(session_key)?
+            .with_context(|| format!("Unknown session: {session_key}"))?;
         let id = Uuid::new_v4().to_string();
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let now = now_rfc3339();
@@ -87,13 +85,11 @@ impl JobSupervisor {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
         }
-        let cwd = resolve_cwd(&session.workspace_path, cwd);
+        let cwd = resolve_cwd(binding.workspace_path(), cwd);
         let job = JobRow {
             id: id.clone(),
             token,
-            session_key: session.key,
-            channel_id: conversation_id.to_string(),
-            root_thread_ts: root_message_id.to_string(),
+            session_key: binding.key().to_owned(),
             kind: kind.trim().to_string(),
             shell: shell.to_string(),
             cwd: cwd.display().to_string(),
@@ -131,25 +127,27 @@ impl JobSupervisor {
         &self,
         job_id: Option<&str>,
         summary: &str,
-        conversation_id: &str,
-        root_message_id: &str,
+        session_key: &str,
     ) -> Result<&'static str> {
         let job = match job_id {
             Some(job_id) => {
                 let job = self.db.get_job(job_id)?.context("job_not_found")?;
-                if job.channel_id != conversation_id || job.root_thread_ts != root_message_id {
+                if job.session_key != session_key {
                     anyhow::bail!("job_session_mismatch");
                 }
                 Some(job)
             }
             None => None,
         };
+        let binding = self
+            .db
+            .get_binding(session_key)?
+            .context("session_not_found")?;
         crate::delivery::handle_job_event(
             &self.config,
             &self.db,
             JobEvent {
-                conversation_id: conversation_id.to_string(),
-                root_message_id: root_message_id.to_string(),
+                session_key: binding.key().to_owned(),
                 job_id: job_id.unwrap_or("notify").to_string(),
                 kind: "notify".into(),
                 event_kind: "notify".into(),
@@ -174,11 +172,7 @@ impl JobSupervisor {
             "shell": job.shell,
             "scriptPath": job.script_path,
             "restartOnBoot": job.restart_on_boot,
-            "platform": "slack",
-            "conversationId": job.channel_id,
-            "rootMessageId": job.root_thread_ts,
-            "channelId": job.channel_id,
-            "rootThreadTs": job.root_thread_ts,
+            "sessionKey": job.session_key,
             "createdAt": job.created_at,
         })
     }
@@ -188,6 +182,10 @@ impl JobSupervisor {
         if running.contains_key(&job.id) {
             return Ok(());
         }
+        let binding = self
+            .db
+            .get_binding(&job.session_key)?
+            .context("job session missing")?;
         let path_value = prepend_path(&self.config.zork_bin_dir);
         let mut command = Command::new(&job.script_path);
         command
@@ -199,16 +197,19 @@ impl JobSupervisor {
             .env("PATH", path_value)
             .env("BROKER_JOB_ID", &job.id)
             .env("BROKER_API_BASE", &self.config.broker_http_base_url)
-            .env("CHAT_PLATFORM", "slack")
-            .env("CHAT_CONVERSATION_ID", &job.channel_id)
-            .env("CHAT_ROOT_MESSAGE_ID", &job.root_thread_ts)
-            .env("SLACK_CHANNEL_ID", &job.channel_id)
-            .env("SLACK_THREAD_TS", &job.root_thread_ts)
+            .env("CHAT_PLATFORM", binding.platform())
+            .env("CHAT_CONNECTION_ID", binding.connection_id())
             .env("SESSION_KEY", &job.session_key)
             .env("SESSION_WORKSPACE", &job.cwd)
             .env("REPOS_ROOT", &self.config.repos_root)
             .env("WORKTREE_PATH", &job.cwd)
             .env("BACKGROUND_JOB_KIND", &job.kind);
+        if let Some(conversation_id) = binding.conversation_id() {
+            command.env("CHAT_CONVERSATION_ID", conversation_id);
+        }
+        if let Some(root_message_id) = binding.root_message_id() {
+            command.env("CHAT_ROOT_MESSAGE_ID", root_message_id);
+        }
         if let Some(path) = &self.config.real_gh_path {
             command.env("BROKER_REAL_GH_PATH", path);
         }
@@ -233,8 +234,7 @@ impl JobSupervisor {
         }
         self.db.update_job_status(&job.id, "running", None, None)?;
         let job_id = job.id.clone();
-        let conversation_id = job.channel_id.clone();
-        let root_message_id = job.root_thread_ts.clone();
+        let session_key = job.session_key.clone();
         let kind = job.kind.clone();
         running.insert(job.id.clone(), child);
         drop(running);
@@ -251,8 +251,7 @@ impl JobSupervisor {
                         &timeout_config,
                         &timeout_db,
                         JobEvent {
-                            conversation_id,
-                            root_message_id,
+                            session_key,
                             job_id: job_id.clone(),
                             kind,
                             event_kind: "job_timeout".into(),
@@ -309,8 +308,7 @@ pub async fn watch_job_exit(supervisor: Arc<JobSupervisor>, job_id: String) {
                         &supervisor.config,
                         &supervisor.db,
                         JobEvent {
-                            conversation_id: job.channel_id,
-                            root_message_id: job.root_thread_ts,
+                            session_key: job.session_key,
                             job_id: job.id,
                             kind: job.kind,
                             event_kind: if ok {

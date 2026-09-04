@@ -1,0 +1,32 @@
+name: Benchmark adapters
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/deep-swe/**"
+      - ".github/workflows/benchmarks.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/deep-swe/**"
+      - ".github/workflows/benchmarks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-adapters-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  adapters:
+    name: DeepSWE adapter unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.11.7
+      - run: uv run --frozen --project benchmarks/deep-swe python -m unittest discover -s benchmarks/deep-swe/tests -p 'test_*.py'

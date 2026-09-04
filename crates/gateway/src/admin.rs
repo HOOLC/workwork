@@ -20,7 +20,17 @@ pub fn router(state: RuntimeState) -> Router {
         .route("/", get(|| async { Redirect::temporary("/admin") }))
         .route("/admin/api/overview", get(overview))
         .route("/admin/api/status", get(status))
-        .route("/admin/api/settings", get(get_settings).put(put_settings))
+        .route("/admin/api/im/providers", get(list_im_providers))
+        .route(
+            "/admin/api/im/connections",
+            get(list_im_connections).post(create_im_connection),
+        )
+        .route(
+            "/admin/api/im/connections/{connection_id}",
+            get(get_im_connection)
+                .patch(update_im_connection)
+                .delete(delete_im_connection),
+        )
         .route("/admin/api/operations", get(operations))
         .route("/admin/api/audit", get(audit))
         .route("/admin/api/profiles", get(list_profiles))
@@ -51,6 +61,10 @@ pub fn router(state: RuntimeState) -> Router {
         .route(
             "/admin/api/sessions/{session_key}/reset",
             post(runtime_http::reset_session),
+        )
+        .route(
+            "/admin/api/sessions/{session_key}/context",
+            get(get_session_context).put(update_session_context),
         )
         .route(
             "/admin/api/sessions/{session_key}/selection",
@@ -105,9 +119,7 @@ async fn merge_page(state: RuntimeState, include_sessions: bool) -> Response {
             "runtimeBaseUrl": format!("http://127.0.0.1:{}", state.config.bind_addr.port()),
             "adminTokenConfigured": state.admin.admin_token.is_some(),
             "dataRoot": state.config.data_root,
-            "slackConfigured": zork_config::load_config(&state.config.data_root)
-                .ok()
-                .is_some_and(|file| zork_config::slack_configured(&file)),
+            "imConnectionCount": state.connections.configs().await.len(),
         },
         "profiles": profiles,
         "githubAuthorMappings": github_author_mappings,
@@ -118,9 +130,7 @@ async fn merge_page(state: RuntimeState, include_sessions: bool) -> Response {
         "operations": operations,
         "auditEvents": audit,
         "state": state_value,
-        "platforms": {
-            "slack": { "state": "ready", "enabled": true }
-        },
+        "imConnections": state.connections.views().await,
     }))
     .into_response()
 }
@@ -131,44 +141,74 @@ async fn profiles(state: &RuntimeState) -> Value {
         .unwrap_or_else(|error| json!({ "ok": false, "error": error.to_string() }))
 }
 
-#[derive(Deserialize, Default)]
-struct SettingsBody {
-    slack: Option<SlackSettingsBody>,
+async fn list_im_providers(State(state): State<RuntimeState>, headers: HeaderMap) -> Response {
+    if !authorize(&headers, &state) {
+        return unauthorized();
+    }
+    Json(json!({ "ok": true, "providers": crate::connections::provider_catalog() })).into_response()
+}
+
+async fn list_im_connections(State(state): State<RuntimeState>, headers: HeaderMap) -> Response {
+    if !authorize(&headers, &state) {
+        return unauthorized();
+    }
+    Json(json!({ "ok": true, "connections": state.connections.views().await })).into_response()
+}
+
+async fn get_im_connection(
+    State(state): State<RuntimeState>,
+    headers: HeaderMap,
+    Path(connection_id): Path<String>,
+) -> Response {
+    if !authorize(&headers, &state) {
+        return unauthorized();
+    }
+    match state.connections.view(&connection_id).await {
+        Some(connection) => Json(json!({ "ok": true, "connection": connection })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "connection_not_found" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateImConnectionBody {
+    name: String,
+    provider: String,
+    mode: zork_config::ImMode,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(rename = "appToken")]
+    app_token: String,
+    #[serde(rename = "botToken")]
+    bot_token: String,
+    #[serde(default, rename = "apiBaseUrl")]
+    api_base_url: String,
 }
 
 #[derive(Deserialize, Default)]
-struct SlackSettingsBody {
+struct UpdateImConnectionBody {
+    name: Option<String>,
+    mode: Option<zork_config::ImMode>,
+    enabled: Option<bool>,
     #[serde(rename = "appToken")]
     app_token: Option<String>,
     #[serde(rename = "botToken")]
     bot_token: Option<String>,
+    #[serde(rename = "apiBaseUrl")]
+    api_base_url: Option<String>,
 }
 
-async fn get_settings(State(state): State<RuntimeState>, headers: HeaderMap) -> Response {
-    if !authorize(&headers, &state) {
-        return unauthorized();
-    }
-    let file = zork_config::load_config(&state.config.data_root)
-        .unwrap_or_else(|_| zork_config::FileConfig::default());
-    let app_set = !file.slack.app_token.trim().is_empty();
-    let bot_set = !file.slack.bot_token.trim().is_empty();
-    Json(json!({
-        "ok": true,
-        "slack": {
-            "configured": app_set && bot_set,
-            "appTokenSet": app_set,
-            "botTokenSet": bot_set,
-            "appTokenConfigured": app_set,
-            "botTokenConfigured": bot_set,
-        },
-    }))
-    .into_response()
+fn default_true() -> bool {
+    true
 }
 
-async fn put_settings(
+async fn create_im_connection(
     State(state): State<RuntimeState>,
     headers: HeaderMap,
-    body: Option<Json<SettingsBody>>,
+    body: Option<Json<CreateImConnectionBody>>,
 ) -> Response {
     if !authorize(&headers, &state) {
         return unauthorized();
@@ -180,42 +220,147 @@ async fn put_settings(
         )
             .into_response();
     };
-    let mut file = match zork_config::load_config(&state.config.data_root) {
-        Ok(file) => file,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "ok": false, "error": error.to_string() })),
-            )
-                .into_response()
-        }
-    };
-    if let Some(slack) = body.slack {
-        if let Some(app_token) = slack.app_token {
-            file.slack.app_token = app_token.trim().to_string();
-        }
-        if let Some(bot_token) = slack.bot_token {
-            file.slack.bot_token = bot_token.trim().to_string();
-        }
-    }
-    if let Err(error) = zork_config::save_config(&state.config.data_root, &file) {
+    let name = body.name.trim();
+    if name.is_empty() {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "ok": false, "error": error.to_string() })),
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "connection_name_required" })),
         )
             .into_response();
     }
-    let app_set = !file.slack.app_token.trim().is_empty();
-    let bot_set = !file.slack.bot_token.trim().is_empty();
-    Json(json!({
-        "ok": true,
-        "slack": {
-            "configured": app_set && bot_set,
-            "appTokenSet": app_set,
-            "botTokenSet": bot_set,
-        },
-    }))
-    .into_response()
+    if body.provider != "slack" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "provider_not_supported" })),
+        )
+            .into_response();
+    }
+    if body.app_token.trim().is_empty() || body.bot_token.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "credentials_required" })),
+        )
+            .into_response();
+    }
+    let connection = zork_config::ImConnectionConfig {
+        id: ulid::Ulid::new().to_string(),
+        name: name.to_owned(),
+        enabled: body.enabled,
+        mode: body.mode,
+        provider: zork_config::ImProviderConfig::Slack(zork_config::SlackProviderConfig {
+            app_token: body.app_token.trim().to_owned(),
+            bot_token: body.bot_token.trim().to_owned(),
+            api_base_url: body.api_base_url.trim().to_owned(),
+        }),
+    };
+    match state.connections.create(connection).await {
+        Ok(connection) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "connection": connection })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_im_connection(
+    State(state): State<RuntimeState>,
+    headers: HeaderMap,
+    Path(connection_id): Path<String>,
+    body: Option<Json<UpdateImConnectionBody>>,
+) -> Response {
+    if !authorize(&headers, &state) {
+        return unauthorized();
+    }
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_body" })),
+        )
+            .into_response();
+    };
+    let Some(mut connection) = state
+        .connections
+        .configs()
+        .await
+        .into_iter()
+        .find(|connection| connection.id == connection_id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "connection_not_found" })),
+        )
+            .into_response();
+    };
+    if let Some(name) = body.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "connection_name_required" })),
+            )
+                .into_response();
+        }
+        connection.name = name.to_owned();
+    }
+    if let Some(mode) = body.mode {
+        connection.mode = mode;
+    }
+    if let Some(enabled) = body.enabled {
+        connection.enabled = enabled;
+    }
+    let zork_config::ImProviderConfig::Slack(slack) = &mut connection.provider;
+    if let Some(token) = body.app_token.filter(|value| !value.trim().is_empty()) {
+        slack.app_token = token.trim().to_owned();
+    }
+    if let Some(token) = body.bot_token.filter(|value| !value.trim().is_empty()) {
+        slack.bot_token = token.trim().to_owned();
+    }
+    if let Some(base_url) = body.api_base_url {
+        slack.api_base_url = base_url.trim().to_owned();
+    }
+    match state.connections.update(connection).await {
+        Ok(Some(connection)) => {
+            Json(json!({ "ok": true, "connection": connection })).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "connection_not_found" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_im_connection(
+    State(state): State<RuntimeState>,
+    headers: HeaderMap,
+    Path(connection_id): Path<String>,
+) -> Response {
+    if !authorize(&headers, &state) {
+        return unauthorized();
+    }
+    match state.connections.delete(&connection_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "connection_not_found" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn operations(State(state): State<RuntimeState>, headers: HeaderMap) -> Response {
@@ -321,6 +466,77 @@ async fn delete_profile(
     }
 }
 
+async fn get_session_context(
+    State(state): State<RuntimeState>,
+    headers: HeaderMap,
+    Path(session_key): Path<String>,
+) -> Response {
+    session_context(&state, &headers, &session_key, None).await
+}
+
+async fn update_session_context(
+    State(state): State<RuntimeState>,
+    headers: HeaderMap,
+    Path(session_key): Path<String>,
+    body: Result<Json<zork_agent_api::ContextConfig>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if !authorize(&headers, &state) {
+        return unauthorized();
+    }
+    let Json(config) = match body {
+        Ok(config) => config,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "invalid_context"})),
+            )
+                .into_response()
+        }
+    };
+    session_context(&state, &headers, &session_key, Some(&config)).await
+}
+
+async fn session_context(
+    state: &RuntimeState,
+    headers: &HeaderMap,
+    session_key: &str,
+    update: Option<&zork_agent_api::ContextConfig>,
+) -> Response {
+    if !authorize(headers, state) {
+        return unauthorized();
+    }
+    let session_id = match state.db.get_binding(session_key) {
+        Ok(Some(binding)) => match binding.id() {
+            Some(id) => id.to_owned(),
+            None => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "agent_session_not_created"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "session_not_found"})),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    match agent::session_context(&state.config, &session_id, update).await {
+        Ok(config) => Json(config).into_response(),
+        Err(error) => (error.status, Json(json!({"error": error.message}))).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionSelectionBody {
@@ -358,8 +574,8 @@ async fn update_session_selection(
         )
             .into_response();
     }
-    let session = match state.db.get_session(&session_key) {
-        Ok(Some(session)) => session,
+    let binding = match state.db.get_binding(&session_key) {
+        Ok(Some(binding)) => binding,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -397,10 +613,10 @@ async fn update_session_selection(
         )
             .into_response();
     };
-    let (session_id, workspace_path) = match session.id.as_deref() {
+    let (session_id, workspace_path) = match binding.id() {
         Some(session_id) => {
             match agent::update_selection(&state.config, session_id, &selection).await {
-                Ok(_) => (session_id.to_owned(), session.workspace_path.clone()),
+                Ok(_) => (session_id.to_owned(), binding.workspace_path().to_owned()),
                 Err(error) => {
                     return (
                         error.status,
@@ -413,8 +629,8 @@ async fn update_session_selection(
         None => match agent::create_session(
             &state.config,
             &selection,
-            Some(include_str!("../prompts/slack-thread-base-instructions.md")),
-            &session.workspace_path,
+            Some(agent::system_prompt_for_binding(&binding)),
+            binding.workspace_path(),
         )
         .await
         {
@@ -428,8 +644,8 @@ async fn update_session_selection(
             }
         },
     };
-    if let Err(error) = state.db.set_agent_session(
-        &session.key,
+    if let Err(error) = state.db.set_binding_agent_session(
+        &binding,
         &session_id,
         &workspace_path,
         &selection.profile_id,
@@ -444,10 +660,10 @@ async fn update_session_selection(
     }
     let session = state
         .db
-        .get_session(&session.key)
+        .get_binding(binding.key())
         .ok()
         .flatten()
-        .and_then(|session| state.db.session_summary(&session).ok());
+        .and_then(|binding| state.db.binding_summary(&binding).ok());
     Json(json!({
         "ok": true,
         "selection": selection,

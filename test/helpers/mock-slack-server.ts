@@ -14,6 +14,7 @@ export interface AssistantStatusUpdate {
   readonly channel: string;
   readonly threadTs: string;
   readonly status: string;
+  readonly atMs: number;
   readonly loadingMessages?: string | undefined;
 }
 
@@ -149,6 +150,7 @@ export class MockSlackServer {
   readonly ephemeralPosts: EphemeralPost[] = [];
   readonly openedViews: OpenedView[] = [];
   readonly acknowledgedEnvelopeIds: string[] = [];
+  socketConnectionCount = 0;
 
   constructor(
     private readonly botUserId: string,
@@ -175,6 +177,7 @@ export class MockSlackServer {
       }
 
       this.#wsServer.handleUpgrade(request, socket, head, (websocket) => {
+        this.socketConnectionCount += 1;
         this.#socket = websocket;
         websocket.on("message", (data) => {
           const text = data.toString();
@@ -397,6 +400,7 @@ export class MockSlackServer {
         channel: String(body.channel_id),
         threadTs: String(body.thread_ts),
         status: String(body.status ?? ""),
+        atMs: Date.now(),
         loadingMessages: typeof body.loading_messages === "string" && body.loading_messages.length > 0 ? body.loading_messages : undefined,
       });
 

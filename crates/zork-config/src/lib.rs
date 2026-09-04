@@ -16,7 +16,9 @@ const DEFAULT_SLACK_API: &str = "https://slack.com/api";
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileConfig {
     #[serde(default)]
-    pub slack: SlackConfig,
+    pub context: ContextConfig,
+    #[serde(default)]
+    pub im_connections: Vec<ImConnectionConfig>,
     #[serde(default)]
     pub bind: BindConfig,
     #[serde(default)]
@@ -25,14 +27,102 @@ pub struct FileConfig {
     pub admin: AdminConfig,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStrategy {
+    #[default]
+    Compaction,
+    Handoff,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextConfig {
+    pub strategy: ContextStrategy,
+    /// Approximate token target; call/result groups are never split.
+    pub keep_recent_tokens: u32,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ContextStrategy::Compaction,
+            keep_recent_tokens: 20_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImConnectionConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: ImMode,
+    #[serde(flatten)]
+    pub provider: ImProviderConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ImProviderConfig {
+    Slack(SlackProviderConfig),
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SlackConfig {
+pub struct SlackProviderConfig {
     #[serde(default)]
     pub app_token: String,
     #[serde(default)]
     pub bot_token: String,
     #[serde(default)]
     pub api_base_url: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImMode {
+    #[default]
+    Normal,
+    Proactive,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl ImConnectionConfig {
+    pub fn provider_name(&self) -> &'static str {
+        match &self.provider {
+            ImProviderConfig::Slack(_) => "slack",
+        }
+    }
+
+    pub fn slack(&self) -> Option<&SlackProviderConfig> {
+        match &self.provider {
+            ImProviderConfig::Slack(config) => Some(config),
+        }
+    }
+
+    pub fn configured(&self) -> bool {
+        match &self.provider {
+            ImProviderConfig::Slack(config) => {
+                !config.app_token.trim().is_empty() && !config.bot_token.trim().is_empty()
+            }
+        }
+    }
+}
+
+impl SlackProviderConfig {
+    pub fn api_base_url(&self) -> String {
+        let value = self.api_base_url.trim();
+        if value.is_empty() {
+            DEFAULT_SLACK_API.into()
+        } else {
+            value.trim_end_matches('/').to_string()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,13 +372,16 @@ pub fn load_config(data_root: &Path) -> Result<FileConfig> {
 pub fn save_config(data_root: &Path, config: &FileConfig) -> Result<()> {
     fs::create_dir_all(data_root)?;
     let path = config_path(data_root);
+    let temporary_path = data_root.join("config.json.tmp");
     let body = serde_json::to_string_pretty(config)? + "\n";
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    fs::write(&temporary_path, body)
+        .with_context(|| format!("write {}", temporary_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o600))?;
     }
+    fs::rename(&temporary_path, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
 }
 
@@ -298,17 +391,11 @@ pub fn apply_listen(config: &mut FileConfig, host: &str) {
     config.bind.control = replace_host(&config.bind.control, host);
 }
 
-pub fn slack_configured(config: &FileConfig) -> bool {
-    !config.slack.app_token.trim().is_empty() && !config.slack.bot_token.trim().is_empty()
-}
-
-pub fn slack_api_base_url(config: &FileConfig) -> String {
-    let value = config.slack.api_base_url.trim();
-    if value.is_empty() {
-        DEFAULT_SLACK_API.into()
-    } else {
-        value.trim_end_matches('/').to_string()
-    }
+pub fn has_configured_im_connection(config: &FileConfig) -> bool {
+    config
+        .im_connections
+        .iter()
+        .any(ImConnectionConfig::configured)
 }
 
 pub fn loopback_base_url(bind: &str) -> String {
@@ -446,13 +533,42 @@ mod tests {
     #[test]
     fn round_trip_config() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = FileConfig::default();
-        config.slack.app_token = "xapp-1".into();
-        config.slack.bot_token = "xoxb-1".into();
+        let config = FileConfig {
+            im_connections: vec![
+                ImConnectionConfig {
+                    id: "01J00000000000000000000001".into(),
+                    name: "work".into(),
+                    enabled: true,
+                    mode: ImMode::Normal,
+                    provider: ImProviderConfig::Slack(SlackProviderConfig {
+                        app_token: "xapp-1".into(),
+                        bot_token: "xoxb-1".into(),
+                        api_base_url: String::new(),
+                    }),
+                },
+                ImConnectionConfig {
+                    id: "01J00000000000000000000002".into(),
+                    name: "community".into(),
+                    enabled: true,
+                    mode: ImMode::Proactive,
+                    provider: ImProviderConfig::Slack(SlackProviderConfig {
+                        app_token: "xapp-2".into(),
+                        bot_token: "xoxb-2".into(),
+                        api_base_url: "https://slack.example/api/".into(),
+                    }),
+                },
+            ],
+            ..FileConfig::default()
+        };
         save_config(dir.path(), &config).unwrap();
         let loaded = load_config(dir.path()).unwrap();
-        assert_eq!(loaded.slack.app_token, "xapp-1");
-        assert!(slack_configured(&loaded));
+        assert_eq!(loaded.im_connections, config.im_connections);
+        assert_eq!(loaded.im_connections[0].provider_name(), "slack");
+        assert_eq!(
+            loaded.im_connections[1].slack().unwrap().api_base_url(),
+            "https://slack.example/api"
+        );
+        assert!(has_configured_im_connection(&loaded));
     }
 
     #[test]

@@ -20,10 +20,3 @@ pub(crate) fn new_ulid() -> String {
     *last = next;
     next.to_string()
 }
-
-pub(crate) fn observe_ulid(observed: Ulid) {
-    let mut last = last_ulid().lock().expect("ULID generator mutex poisoned");
-    if observed > *last {
-        *last = observed;
-    }
-}

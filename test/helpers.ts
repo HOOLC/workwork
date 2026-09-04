@@ -6,6 +6,28 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const brokerRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const testConnectionId = "01J00000000000000000000TST";
+
+export function testSlackConnection(slackPort: number, mode: "normal" | "proactive" = "normal"): Record<string, unknown> {
+  return {
+    id: testConnectionId,
+    name: "Test Slack",
+    provider: "slack",
+    enabled: true,
+    mode,
+    app_token: "xapp-test",
+    bot_token: "xoxb-test",
+    api_base_url: `http://127.0.0.1:${slackPort}/api`,
+  };
+}
+
+export function testSessionKey(channelId: string, rootMessageId: string): string {
+  return `${testConnectionId}:${channelId}:${rootMessageId}`;
+}
+
+export function testNormalWorkspace(dataRoot: string, channelId: string, rootMessageId: string): string {
+  return path.join(dataRoot, "workspaces", "im", testConnectionId, "normal", channelId, rootMessageId);
+}
 
 export async function getFreePort(): Promise<number> {
   const server = http.createServer();
@@ -66,7 +88,7 @@ export function spawnBinary(
   if (!existsSync(binary)) {
     throw new Error(`${name} debug binary is missing; run cargo build -p ${name}`);
   }
-  return spawn(binary, [...(options.args ?? [])], {
+  const child = spawn(binary, [...(options.args ?? [])], {
     cwd: options.cwd,
     env: {
       ...process.env,
@@ -74,6 +96,11 @@ export function spawnBinary(
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (process.env.ZORK_TEST_CHILD_LOG === "1") {
+    child.stdout?.pipe(process.stdout);
+    child.stderr?.pipe(process.stderr);
+  }
+  return child;
 }
 
 export async function stopChild(child: ChildProcess): Promise<void> {
@@ -98,7 +125,7 @@ export async function waitForReady(url: string, label = "readyz"): Promise<void>
   let lastError = "not ready";
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
       if (response.ok) {
         return;
       }

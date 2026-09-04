@@ -12,7 +12,7 @@ export function profileAccountLabel(profile: AuthProfileRecord): string {
   }
 
   const account = accountStatus.account || {};
-  return readString(account.email) || readString(account.name) || readString(account.id) || "未知账号";
+  return readString(account.email) || readString(account.name) || readString(account.id) || (profile.billing === "usage" ? "API Key" : "未知账号");
 }
 
 export function profilePlanLabel(profile: AuthProfileRecord): string {
@@ -43,11 +43,7 @@ export function profileBillingLabel(profile: AuthProfileRecord): string {
 
 export function profileRuntimeLabel(profile: AuthProfileRecord): string {
   const provider = readString(profile.provider) || "xai";
-  const models = Array.isArray(profile.models) ? profile.models : [];
-  const defaultModel = models.find((model: { default?: boolean }) => model?.default) ?? models[0];
-  const modelId = readString(defaultModel?.id);
-  const thinking = readString(defaultModel?.default_thinking);
-  return [readString(profile.profile_id), provider, profileBillingLabel(profile), modelId, thinking].filter(Boolean).join(" · ");
+  return [readString(profile.profile_id), provider].filter(Boolean).join(" · ");
 }
 
 export function profileOptionLabel(profile: AuthProfileRecord, options: QuotaLabelOptions = {}): string {
@@ -109,7 +105,7 @@ export function profileWeeklyQuotaLabel(profile: AuthProfileRecord, options: Quo
 function formatUsageQuotaLabel(profile: AuthProfileRecord): string {
   const remaining = usageRemainingOf(profile);
   if (remaining === undefined) {
-    return "按量额度未知";
+    return "按量 · 未提供额度信息";
   }
   if (remaining === Number.POSITIVE_INFINITY) {
     return "按量 无限";

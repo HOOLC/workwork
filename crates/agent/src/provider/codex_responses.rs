@@ -23,11 +23,11 @@ use tokio_tungstenite::{
 use url::{Host, Url};
 
 use zork_agent::session::{
-    runtime::{
-        ModelError, ModelOutcome, ModelRequest, ModelTokenUsage, ProfileExecution, ProviderFailure,
-    },
-    state::{
-        ProviderContext, ProviderInputDiagnostics, ProviderInputMode, ToolCall, TranscriptRole,
+    model::{ModelError, ModelOutcome, ModelRequest, ModelTokenUsage, ProviderFailure},
+    ports::ProfileExecution,
+    wire::{
+        ProviderContext, ProviderInputDiagnostics, ProviderInputMode, ProviderToolCall,
+        TranscriptRole,
     },
 };
 
@@ -35,15 +35,17 @@ const WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const MAX_PROXY_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 
 fn retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 409 | 429) || status >= 500
+    !super::provider_failure_is_certainly_permanent(Some(status), None)
 }
+
+const WEBSOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn transport_failure(stage: &'static str, error: impl std::fmt::Display) -> ModelError {
     ModelError::ProviderFailed(ProviderFailure::new(stage, true, error.to_string()))
 }
 
 fn protocol_failure(stage: &'static str, message: impl Into<String>) -> ModelError {
-    ModelError::ProviderFailed(ProviderFailure::new(stage, false, message))
+    ModelError::ProviderFailed(ProviderFailure::new(stage, true, message))
 }
 
 fn status_failure(stage: &'static str, status: u16, message: impl Into<String>) -> ModelError {
@@ -59,7 +61,7 @@ fn websocket_failure(stage: &'static str, error: WebSocketError) -> ModelError {
     };
     let mut failure = ProviderFailure::new(
         stage,
-        status_code.map_or(true, retryable_status),
+        status_code.is_none_or(retryable_status),
         error.to_string(),
     );
     failure.status_code = status_code;
@@ -70,6 +72,9 @@ fn provider_event_failure(event: &Value) -> ModelError {
     let error = event
         .get("error")
         .or_else(|| event.pointer("/response/error"));
+    let incomplete_reason = event
+        .pointer("/response/incomplete_details/reason")
+        .and_then(Value::as_str);
     let status_code = error
         .and_then(|error| error.get("status").or_else(|| error.get("status_code")))
         .and_then(Value::as_u64)
@@ -77,24 +82,31 @@ fn provider_event_failure(event: &Value) -> ModelError {
     let provider_code = error
         .and_then(|error| error.get("code").or_else(|| error.get("type")))
         .and_then(Value::as_str)
+        .or(incomplete_reason)
         .map(ToOwned::to_owned);
     let message = error
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
-        .unwrap_or("provider returned a failed response")
-        .to_owned();
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            incomplete_reason.map(|reason| format!("provider response incomplete: {reason}"))
+        })
+        .unwrap_or_else(|| "provider returned a failed response".to_owned());
     let request_id = event
         .get("request_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let retryable =
+        !super::provider_failure_is_certainly_permanent(status_code, provider_code.as_deref());
     ModelError::ProviderFailed(ProviderFailure {
         stage: "codex.websocket.provider_event",
-        retryable: status_code.is_some_and(retryable_status),
+        retryable,
         status_code,
         provider_code,
         request_id,
         message,
         provider_input: None,
+        usage: parse_usage(event.pointer("/response/usage")).map(Box::new),
     })
 }
 
@@ -211,7 +223,9 @@ impl CodexResponsesProvider {
         execution: ProfileExecution,
     ) -> Result<ModelOutcome, ModelError> {
         if !execution.streaming() {
-            self.release_session(&request.session_id);
+            if !request.independent {
+                self.release_session(&request.session_id);
+            }
             return Err(ModelError::InvalidSelection);
         }
         let logical = build_request(request, &execution)?;
@@ -233,7 +247,9 @@ impl CodexResponsesProvider {
     ) -> Result<ModelOutcome, ModelError> {
         logical.body.insert("stream".to_owned(), Value::Bool(true));
         let identity = ConnectionIdentity::new(execution)?;
-        let session = {
+        let session = if request.independent {
+            Arc::new(AsyncMutex::new(SessionConnection::default()))
+        } else {
             let mut sessions = self
                 .sessions
                 .lock()
@@ -302,7 +318,7 @@ impl CodexResponsesProvider {
                 .send(Message::Text(Value::Object(wire).to_string().into()))
                 .await
                 .map_err(|error| websocket_failure("codex.websocket.send", error))?;
-            read_websocket_response(socket, request, execution).await
+            read_websocket_response(socket, request).await
         }
         .await;
 
@@ -341,7 +357,7 @@ fn with_provider_input(
     provider_input: ProviderInputDiagnostics,
 ) -> ModelError {
     if let ModelError::ProviderFailed(failure) = &mut error {
-        failure.provider_input = Some(provider_input);
+        failure.provider_input = Some(Box::new(provider_input));
     }
     error
 }
@@ -453,7 +469,9 @@ fn build_request(
     execution: &ProfileExecution,
 ) -> Result<LogicalRequest, ModelError> {
     let mut input = Vec::new();
-    input.push(additional_tools(request));
+    if !request.tools.is_empty() {
+        input.push(additional_tools(request));
+    }
     for message in request.transcript.iter() {
         match message.role {
             TranscriptRole::System => input.push(text_message("developer", &message.content)),
@@ -517,7 +535,10 @@ fn build_request(
         ("store".to_owned(), Value::Bool(false)),
         ("input".to_owned(), Value::Array(input)),
         ("tool_choice".to_owned(), Value::String("auto".to_owned())),
-        ("parallel_tool_calls".to_owned(), Value::Bool(true)),
+        (
+            "parallel_tool_calls".to_owned(),
+            Value::Bool(execution.parallel_tool_calls()),
+        ),
         (
             "reasoning".to_owned(),
             json!({
@@ -529,7 +550,14 @@ fn build_request(
         ("include".to_owned(), json!(["reasoning.encrypted_content"])),
         (
             "prompt_cache_key".to_owned(),
-            Value::String(request.session_id.clone()),
+            Value::String(
+                if request.independent {
+                    &request.step_id
+                } else {
+                    &request.session_id
+                }
+                .clone(),
+            ),
         ),
     ]);
     if let Some(service_tier) = execution.service_tier() {
@@ -612,13 +640,18 @@ async fn connect(
     handshake
         .headers_mut()
         .insert("openai-beta", HeaderValue::from_static(WEBSOCKET_BETA));
+    let routing_id = if request.independent {
+        &request.step_id
+    } else {
+        &request.session_id
+    };
     handshake.headers_mut().insert(
         "session-id",
-        HeaderValue::from_str(&request.session_id).map_err(|_| ModelError::InvalidSelection)?,
+        HeaderValue::from_str(routing_id).map_err(|_| ModelError::InvalidSelection)?,
     );
     handshake.headers_mut().insert(
         "x-client-request-id",
-        HeaderValue::from_str(&request.session_id).map_err(|_| ModelError::InvalidSelection)?,
+        HeaderValue::from_str(routing_id).map_err(|_| ModelError::InvalidSelection)?,
     );
     if let Some(proxy) = &identity.proxy {
         let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port))
@@ -844,16 +877,45 @@ async fn establish_proxy_tunnel(
 async fn read_websocket_response(
     socket: &mut CodexSocket,
     request: &ModelRequest,
-    execution: &ProfileExecution,
+) -> Result<CompletedResponse, ModelError> {
+    read_websocket_response_with_idle(socket, request, WEBSOCKET_IDLE_TIMEOUT).await
+}
+
+/// 任何入帧（含 Ping/Pong）重置锚；生成期间后端事件流持续到达，长思考
+/// 不被误杀；静默（连接死/服务卡）超窗即断。计时只活在请求读循环里——
+/// 两个请求之间（工具执行期）的空闲缓存连接不受影响。
+async fn read_websocket_response_with_idle(
+    socket: &mut CodexSocket,
+    request: &ModelRequest,
+    idle_timeout: std::time::Duration,
 ) -> Result<CompletedResponse, ModelError> {
     let mut accumulator = StreamAccumulator::default();
-    while let Some(message) = socket.next().await {
+    let mut last_frame = tokio::time::Instant::now();
+    loop {
+        let message = tokio::time::timeout_at(last_frame + idle_timeout, socket.next())
+            .await
+            .map_err(|_| {
+                transport_failure(
+                    "codex.websocket.idle",
+                    format!(
+                        "no inbound frame for {}s while awaiting response",
+                        idle_timeout.as_secs()
+                    ),
+                )
+            })?;
+        let Some(message) = message else {
+            return Err(transport_failure(
+                "codex.websocket.eof",
+                "provider websocket ended before response.completed",
+            ));
+        };
+        last_frame = tokio::time::Instant::now();
         match message.map_err(|error| websocket_failure("codex.websocket.read", error))? {
             Message::Text(text) => {
                 let event = serde_json::from_str::<Value>(&text).map_err(|error| {
                     protocol_failure("codex.websocket.event_json", error.to_string())
                 })?;
-                if let Some(completed) = accumulator.observe(event, request, execution)? {
+                if let Some(completed) = accumulator.observe(event, request)? {
                     return Ok(completed);
                 }
             }
@@ -875,10 +937,6 @@ async fn read_websocket_response(
             }
         }
     }
-    Err(transport_failure(
-        "codex.websocket.eof",
-        "provider websocket ended before response.completed",
-    ))
 }
 
 #[derive(Default)]
@@ -892,7 +950,6 @@ impl StreamAccumulator {
         &mut self,
         mut event: Value,
         request: &ModelRequest,
-        _execution: &ProfileExecution,
     ) -> Result<Option<CompletedResponse>, ModelError> {
         match event.get("type").and_then(Value::as_str) {
             Some("response.created") => {
@@ -906,8 +963,8 @@ impl StreamAccumulator {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     request.stream_observer.text_delta(
                         &request.session_id,
-                        &request.activation_id,
-                        &request.round_id,
+                        request.generation,
+                        &request.step_id,
                         delta,
                     );
                 }
@@ -1022,18 +1079,18 @@ fn outcome_from_items(
     let mut tool_calls = Vec::new();
     for item in output_items.iter() {
         match item.get("type").and_then(Value::as_str) {
-            Some("reasoning") => {
+            Some("reasoning")
                 if item
                     .get("encrypted_content")
                     .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-                {
-                    return Err(protocol_failure(
-                        "codex.output.reasoning_encrypted_content",
-                        "reasoning output has no encrypted content",
-                    ));
-                }
+                    .is_none_or(str::is_empty) =>
+            {
+                return Err(protocol_failure(
+                    "codex.output.reasoning_encrypted_content",
+                    "reasoning output has no encrypted content",
+                ));
             }
+            Some("reasoning") => {}
             Some("message") => {
                 for content in item
                     .get("content")
@@ -1054,19 +1111,23 @@ fn outcome_from_items(
                 }
             }
             Some("function_call") => {
-                let tool_call_id = required_string(item, "call_id")?;
-                let tool_name = required_string(item, "name")?;
-                let arguments = required_string(item, "arguments")?;
-                let arguments = serde_json::from_str::<Value>(&arguments).map_err(|error| {
-                    protocol_failure("codex.output.tool_arguments_json", error.to_string())
-                })?;
-                if !arguments.is_object() {
-                    return Err(protocol_failure(
-                        "codex.output.tool_arguments_shape",
-                        "function call arguments are not an object",
-                    ));
-                }
-                tool_calls.push(ToolCall {
+                let tool_call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let tool_name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let arguments = match item.get("arguments") {
+                    Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_owned())),
+                    Some(raw) => Value::Array(vec![raw.clone()]),
+                    None => Value::Null,
+                };
+                tool_calls.push(ProviderToolCall {
                     tool_call_id,
                     tool_name,
                     arguments,
@@ -1089,19 +1150,6 @@ fn outcome_from_items(
         usage,
         provider_input: None,
     })
-}
-
-fn required_string(item: &Value, field: &str) -> Result<String, ModelError> {
-    item.get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            protocol_failure(
-                "codex.output.required_string",
-                format!("output item has no non-empty {field}"),
-            )
-        })
 }
 
 fn parse_usage(usage: Option<&Value>) -> Option<ModelTokenUsage> {
@@ -1157,6 +1205,177 @@ mod tests {
     use super::*;
 
     #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01]
+    fn request_uses_codex_wire_contract_and_profile_parallelism() {
+        let execution = ProfileExecution::new(
+            "profile".into(),
+            "openai".into(),
+            "gpt-5.6-luna".into(),
+            "openai-codex-responses".into(),
+            true,
+            false,
+            None,
+            "https://example.invalid".into(),
+            HashMap::new(),
+            "max".into(),
+            zork_agent::session::ports::ModelLimits {
+                context_window_tokens: 256_000,
+                max_output_tokens: 32_000,
+                reserve_percent: 10,
+            },
+            "secret".into(),
+        );
+        let request = ModelRequest {
+            session_id: "session".into(),
+            generation: 1,
+            step_id: "step".into(),
+            selection: zork_agent::session::wire::SessionSelection {
+                profile_id: "profile".into(),
+                model: "gpt-5.6-luna".into(),
+                thinking: "max".into(),
+            },
+            transcript: Arc::new(Vec::new()),
+            tools: Arc::new(Vec::new()),
+            max_output_tokens: Some(32_000),
+            independent: false,
+            stream_observer: Arc::new(zork_agent::session::model::SilentStreamObserver),
+        };
+
+        let body = build_request(&request, &execution).unwrap().body;
+        assert!(!body.contains_key("max_output_tokens"));
+        assert_eq!(body.get("parallel_tool_calls"), Some(&json!(false)));
+
+        let parallel_execution = ProfileExecution::new(
+            "profile".into(),
+            "openai".into(),
+            "gpt-5.6-luna".into(),
+            "openai-codex-responses".into(),
+            true,
+            true,
+            None,
+            "https://example.invalid".into(),
+            HashMap::new(),
+            "max".into(),
+            zork_agent::session::ports::ModelLimits {
+                context_window_tokens: 256_000,
+                max_output_tokens: 32_000,
+                reserve_percent: 10,
+            },
+            "secret".into(),
+        );
+        let body = build_request(&request, &parallel_execution).unwrap().body;
+        assert_eq!(body.get("parallel_tool_calls"), Some(&json!(true)));
+    }
+
+    #[tokio::test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01]
+    async fn proxy_tunnel_uses_the_selected_authority_and_proxy_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 256];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..read]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        establish_proxy_tunnel(&mut client, "codex.example:443", Some("Basic dXNlcjpwYXNz"))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            "CONNECT codex.example:443 HTTP/1.1\r\nHost: codex.example:443\r\nProxy-Connection: Keep-Alive\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+        );
+
+        let proxy = proxy_from_values(
+            "wss://codex.example/backend-api/codex/responses",
+            Some("http://user:pass@proxy.example:8080"),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(proxy.host, "proxy.example");
+        assert_eq!(proxy.port, 8080);
+        assert_eq!(proxy.authorization.as_deref(), Some("Basic dXNlcjpwYXNz"));
+    }
+
+    /// 入帧空闲超时：服务端接受连接后装死（复刻 v2cover2 事故——请求在途
+    /// 15 分钟无帧、无错误、无重试），短窗下必须以 retryable 错误浮出，
+    /// 交给 step 内退避重试。
+    #[tokio::test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, RETRY-01]
+    async fn idle_timeout_breaks_silent_websocket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // 收下请求，然后一个字都不发。
+            let _ = ws.next().await;
+            std::future::pending::<()>().await;
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (ws, _response) = tokio_tungstenite::client_async_tls("ws://127.0.0.1/", tcp)
+            .await
+            .unwrap();
+        let mut socket = CodexSocket::new(ws);
+        socket
+            .send(Message::Text(r#"{"type":"response.create"}"#.into()))
+            .await
+            .unwrap();
+
+        let request = ModelRequest {
+            session_id: "s".into(),
+            generation: 1,
+            step_id: "r".into(),
+            selection: zork_agent::session::wire::SessionSelection {
+                profile_id: "p".into(),
+                model: "m".into(),
+                thinking: "max".into(),
+            },
+            transcript: std::sync::Arc::new(Vec::new()),
+            tools: std::sync::Arc::new(Vec::new()),
+            max_output_tokens: None,
+            independent: false,
+            stream_observer: std::sync::Arc::new(zork_agent::session::model::SilentStreamObserver),
+        };
+        let started = std::time::Instant::now();
+        let result = read_websocket_response_with_idle(
+            &mut socket,
+            &request,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        match result {
+            Err(ModelError::ProviderFailed(failure)) => {
+                assert_eq!(failure.stage, "codex.websocket.idle");
+                assert!(failure.retryable, "空闲超时必须可重试（接退避）");
+            }
+            _ => panic!("expected idle failure"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "空闲窗口应在秒级生效"
+        );
+        server.abort();
+    }
+
+    #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, RETRY-02]
     fn provider_error_event_preserves_explicit_status_and_code() {
         let error = provider_event_failure(&json!({
             "type": "error",
@@ -1173,161 +1392,65 @@ mod tests {
         assert_eq!(failure.stage, "codex.websocket.provider_event");
         assert!(failure.retryable);
         assert_eq!(failure.status_code, Some(429));
+        assert_eq!(failure.request_id, Some("req_123".to_owned()));
         assert_eq!(
-            failure.provider_code.as_deref(),
-            Some("rate_limit_exceeded")
+            failure.provider_code,
+            Some("rate_limit_exceeded".to_owned())
         );
-        assert_eq!(failure.request_id.as_deref(), Some("req_123"));
         assert_eq!(failure.message, "slow down");
     }
 
     #[test]
-    fn transport_and_protocol_failures_have_distinct_retry_semantics() {
-        let ModelError::ProviderFailed(transport) =
-            transport_failure("codex.websocket.read", "connection reset")
-        else {
-            panic!("expected transport failure");
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, RETRY-02]
+    fn incomplete_event_preserves_its_reason() {
+        let error = provider_event_failure(&json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": {
+                    "input_tokens": 321,
+                    "input_tokens_details": { "cached_tokens": 123 },
+                    "output_tokens": 45,
+                    "output_tokens_details": { "reasoning_tokens": 34 }
+                }
+            }
+        }));
+        let ModelError::ProviderFailed(failure) = error else {
+            panic!("expected provider failure");
         };
-        let ModelError::ProviderFailed(protocol) =
-            protocol_failure("codex.event.output_item", "missing item")
-        else {
-            panic!("expected protocol failure");
+        assert_eq!(failure.provider_code.as_deref(), Some("max_output_tokens"));
+        assert_eq!(
+            failure.message,
+            "provider response incomplete: max_output_tokens"
+        );
+        let usage = failure.usage.expect("incomplete response usage");
+        assert_eq!(usage.input_tokens, 321);
+        assert_eq!(usage.cached_input_tokens, Some(123));
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.output_reasoning_tokens, Some(34));
+        assert!(failure.retryable);
+    }
+
+    /// 单连接 60 分钟硬限必须可重试：重试路径 session.reset() 已弃旧连接，
+    /// 重连即获新窗口（v2idle 第 61 分钟非重试终结实证）。
+    #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, RETRY-02]
+    fn websocket_connection_limit_is_retryable() {
+        let error = provider_event_failure(&json!({
+            "type": "error",
+            "error": {
+                "code": "websocket_connection_limit_reached",
+                "message": "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."
+            }
+        }));
+        let ModelError::ProviderFailed(failure) = error else {
+            panic!("expected provider failure");
         };
-        assert!(transport.retryable);
-        assert!(!protocol.retryable);
-    }
-
-    #[test]
-    fn selects_the_scheme_specific_http_proxy_and_decodes_basic_auth() {
-        let selected = proxy_from_values(
-            "wss://chatgpt.com/backend-api/codex/responses",
-            Some("http://agent:p%40ss@proxy.internal:8080"),
-            Some("http://fallback.internal:3128"),
-            None,
-        )
-        .expect("valid proxy")
-        .expect("selected proxy");
-        assert_eq!(selected.host, "proxy.internal");
-        assert_eq!(selected.port, 8080);
         assert_eq!(
-            selected.authorization.as_deref(),
-            Some("Basic YWdlbnQ6cEBzcw==")
+            failure.provider_code.as_deref(),
+            Some("websocket_connection_limit_reached")
         );
-
-        let selected = proxy_from_values(
-            "ws://provider.internal/responses",
-            Some("http://unused.internal:8080"),
-            Some("http://plain.internal:3128"),
-            None,
-        )
-        .expect("valid proxy")
-        .expect("selected proxy");
-        assert_eq!(selected.host, "plain.internal");
-        assert_eq!(selected.port, 3128);
-    }
-
-    #[test]
-    fn falls_back_to_http_proxy_for_wss() {
-        let selected = proxy_from_values(
-            "wss://chatgpt.com/backend-api/codex/responses",
-            None,
-            Some("http://proxy.internal:8080"),
-            None,
-        )
-        .expect("valid proxy")
-        .expect("selected proxy");
-        assert_eq!(selected.host, "proxy.internal");
-        assert_eq!(selected.port, 8080);
-        assert!(selected.authorization.is_none());
-    }
-
-    #[test]
-    fn no_proxy_matches_exact_hosts_subdomains_ports_and_wildcard() {
-        let proxy = Some("http://proxy.internal:8080");
-        assert!(proxy_from_values(
-            "wss://chatgpt.com/responses",
-            proxy,
-            None,
-            Some("chatgpt.com")
-        )
-        .expect("valid selection")
-        .is_none());
-        assert!(proxy_from_values(
-            "wss://api.chatgpt.com/responses",
-            proxy,
-            None,
-            Some(".chatgpt.com")
-        )
-        .expect("valid selection")
-        .is_none());
-        assert!(proxy_from_values(
-            "wss://chatgpt.com:8443/responses",
-            proxy,
-            None,
-            Some("chatgpt.com:443")
-        )
-        .expect("valid selection")
-        .is_some());
-        assert!(
-            proxy_from_values("wss://chatgpt.com/responses", proxy, None, Some("*"))
-                .expect("valid selection")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn rejects_non_http_proxy_urls() {
-        assert!(matches!(
-            proxy_from_values(
-                "wss://chatgpt.com/responses",
-                Some("socks5://proxy.internal:1080"),
-                None,
-                None,
-            ),
-            Err(ModelError::InvalidSelection)
-        ));
-    }
-
-    #[test]
-    fn renders_endpoint_authorities_without_paths() {
-        assert_eq!(
-            endpoint_authority("wss://chatgpt.com/backend-api/codex/responses")
-                .expect("domain authority"),
-            "chatgpt.com:443"
-        );
-        assert_eq!(
-            endpoint_authority("ws://[::1]:8123/responses").expect("IPv6 authority"),
-            "[::1]:8123"
-        );
-    }
-
-    #[test]
-    fn continuation_requires_the_exact_request_response_prefix() {
-        let continuation = Continuation {
-            properties: json!({ "model": "model" }),
-            request_input: vec![json!({ "role": "user", "content": "one" })],
-            response_id: "resp_1".to_owned(),
-            response_items: Arc::new(vec![json!({ "type": "reasoning", "id": "rs_1" })]),
-        };
-        let current = vec![
-            json!({ "role": "user", "content": "one" }),
-            json!({ "type": "reasoning", "id": "rs_1" }),
-            json!({ "type": "function_call_output", "call_id": "call_1" }),
-        ];
-        let (response_id, delta) = continuation
-            .delta(&json!({ "model": "model" }), &current)
-            .expect("exact extension");
-        assert_eq!(response_id, "resp_1");
-        assert_eq!(delta, &current[2..]);
-        assert!(continuation
-            .delta(&json!({ "model": "different" }), &current)
-            .is_none());
-        let changed = vec![
-            json!({ "role": "user", "content": "changed" }),
-            json!({ "type": "reasoning", "id": "rs_1" }),
-        ];
-        assert!(continuation
-            .delta(&json!({ "model": "model" }), &changed)
-            .is_none());
+        assert!(failure.retryable, "连接限须可重试（重连即愈）");
     }
 }

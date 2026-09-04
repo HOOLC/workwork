@@ -1,7 +1,9 @@
+mod agent_port;
 mod codex_responses;
 mod fake;
 mod responses;
 
+pub use agent_port::AgentModelPort;
 pub use fake::FakeProvider;
 
 use aimux_core::{
@@ -26,23 +28,31 @@ use std::collections::HashMap;
 use url::Url;
 
 use zork_agent::session::{
-    runtime::{
-        ModelError, ModelExecutor, ModelOutcome, ModelRequest, ProfileExecution, ProviderFailure,
+    model::{ModelError, ModelOutcome, ModelRequest, ProviderFailure},
+    ports::{ModelExecutor, ProfileExecution},
+    wire::{
+        ProviderContext, ProviderInputDiagnostics, ProviderInputMode, ProviderMessage,
+        ProviderToolCall, TranscriptRole,
     },
-    state::{ProviderContext, ProviderMessage, ToolCall, TranscriptRole},
 };
 
 pub struct ProviderRouter {
     codex_responses: codex_responses::CodexResponsesProvider,
 }
 
+impl Default for ProviderRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn aimux_failure(stage: &'static str, error: AiMuxError) -> ModelError {
-    let retryable = error.is_retryable();
     let status_code = error.status_code();
     let (provider_code, request_id) = match &error {
         AiMuxError::ApiCall(detail) => (detail.provider_code.clone(), detail.request_id.clone()),
         _ => (None, None),
     };
+    let retryable = !provider_failure_is_certainly_permanent(status_code, provider_code.as_deref());
     ModelError::ProviderFailed(ProviderFailure {
         stage,
         retryable,
@@ -51,11 +61,32 @@ fn aimux_failure(stage: &'static str, error: AiMuxError) -> ModelError {
         request_id,
         message: error.to_string(),
         provider_input: None,
+        usage: None,
     })
 }
 
 fn protocol_failure(stage: &'static str, message: impl Into<String>) -> ModelError {
-    ModelError::ProviderFailed(ProviderFailure::new(stage, false, message))
+    ModelError::ProviderFailed(ProviderFailure::new(stage, true, message))
+}
+
+pub(super) fn provider_failure_is_certainly_permanent(
+    status_code: Option<u16>,
+    provider_code: Option<&str>,
+) -> bool {
+    if matches!(status_code, Some(401 | 403)) {
+        return true;
+    }
+    let Some(code) = provider_code else {
+        return false;
+    };
+    matches!(
+        code.to_ascii_lowercase().as_str(),
+        "invalid_api_key"
+            | "authentication_error"
+            | "unauthorized"
+            | "permission_denied"
+            | "account_deactivated"
+    )
 }
 
 impl ProviderRouter {
@@ -103,7 +134,7 @@ impl ProviderRouter {
             })
             .collect::<Vec<_>>();
         let options = CallOptions {
-            tools: Some(tools),
+            tools: (!tools.is_empty()).then_some(tools),
             max_output_tokens: request.max_output_tokens,
             headers: (!execution.headers().is_empty()).then(|| execution.headers().clone()),
             reasoning: Some(reasoning_effort(execution.thinking())),
@@ -113,35 +144,82 @@ impl ProviderRouter {
         };
         if responses_api {
             let input = responses_input_from_transcript(request.transcript.as_slice(), &execution)?;
+            let provider_input = full_input_diagnostics(request.transcript.len(), input.len());
             if execution.streaming() {
                 let result = responses::do_stream(&options, &execution, input)
                     .await
-                    .map_err(|error| aimux_failure("openai.responses.stream_start", error))?;
+                    .map_err(|error| {
+                        with_provider_diagnostics(
+                            aimux_failure("openai.responses.stream_start", error),
+                            Some(Box::new(provider_input.clone())),
+                            None,
+                        )
+                    })?;
                 return model_outcome_from_stream_result(
                     result.result,
                     request,
                     &execution,
                     Some(result.output_items),
+                    provider_input,
                 )
                 .await;
             }
             let result = responses::do_generate(&options, &execution, input)
                 .await
-                .map_err(|error| aimux_failure("openai.responses.generate", error))?;
+                .map_err(|error| {
+                    with_provider_diagnostics(
+                        aimux_failure("openai.responses.generate", error),
+                        Some(Box::new(provider_input.clone())),
+                        None,
+                    )
+                })?;
             return model_outcome_from_generate_result(
                 result.result,
                 &execution,
                 Some(result.output_items),
+                provider_input,
             );
         }
+        let provider_input = full_input_diagnostics(request.transcript.len(), options.prompt.len());
         if execution.streaming() {
-            let result = stream_request(&options, &execution).await?;
-            model_outcome_from_stream_result(result, request, &execution, None).await
+            let result = stream_request(&options, &execution)
+                .await
+                .map_err(|error| {
+                    with_provider_diagnostics(error, Some(Box::new(provider_input.clone())), None)
+                })?;
+            model_outcome_from_stream_result(result, request, &execution, None, provider_input)
+                .await
         } else {
-            let result = generate_request(&options, &execution).await?;
-            model_outcome_from_generate_result(result, &execution, None)
+            let result = generate_request(&options, &execution)
+                .await
+                .map_err(|error| {
+                    with_provider_diagnostics(error, Some(Box::new(provider_input.clone())), None)
+                })?;
+            model_outcome_from_generate_result(result, &execution, None, provider_input)
         }
     }
+}
+
+fn full_input_diagnostics(logical_items: usize, sent_items: usize) -> ProviderInputDiagnostics {
+    ProviderInputDiagnostics {
+        mode: ProviderInputMode::Full,
+        logical_input_items: u64::try_from(logical_items).unwrap_or(u64::MAX),
+        sent_input_items: u64::try_from(sent_items).unwrap_or(u64::MAX),
+        previous_response_id: None,
+        response_id: None,
+    }
+}
+
+fn with_provider_diagnostics(
+    mut error: ModelError,
+    provider_input: Option<Box<ProviderInputDiagnostics>>,
+    usage: Option<zork_agent::session::model::ModelTokenUsage>,
+) -> ModelError {
+    if let ModelError::ProviderFailed(failure) = &mut error {
+        failure.provider_input = provider_input;
+        failure.usage = usage.map(Box::new);
+    }
+    error
 }
 
 async fn stream_request(
@@ -220,7 +298,8 @@ struct ModelOutcomeAccumulator {
     text: String,
     tool_calls: Vec<PendingToolCall>,
     provider_context: Option<ProviderContext>,
-    usage: Option<zork_agent::session::runtime::ModelTokenUsage>,
+    usage: Option<zork_agent::session::model::ModelTokenUsage>,
+    provider_input: Option<Box<ProviderInputDiagnostics>>,
 }
 
 impl ModelOutcomeAccumulator {
@@ -230,53 +309,94 @@ impl ModelOutcomeAccumulator {
             .find(|call| call.tool_call_id == tool_call_id)
     }
 
+    fn attach_failure(&self, error: ModelError) -> ModelError {
+        with_provider_diagnostics(error, self.provider_input.clone(), self.usage.clone())
+    }
+
+    fn observe_response_id(&mut self, response_id: Option<String>) {
+        if let (Some(input), Some(response_id)) = (&mut self.provider_input, response_id) {
+            input.response_id = Some(response_id);
+        }
+    }
+
     fn complete(self, finish_reason: FinishReason) -> Result<ModelOutcome, ModelError> {
+        let Self {
+            text,
+            tool_calls,
+            provider_context,
+            usage,
+            provider_input,
+        } = self;
+        let failure = |stage, message| {
+            with_provider_diagnostics(
+                protocol_failure(stage, message),
+                provider_input.clone(),
+                usage.clone(),
+            )
+        };
         match finish_reason.unified {
-            FinishReasonUnified::Stop if self.tool_calls.is_empty() => Ok(ModelOutcome {
-                text: self.text,
+            FinishReasonUnified::Stop if tool_calls.is_empty() => Ok(ModelOutcome {
+                text,
                 tool_calls: Vec::new(),
-                provider_context: self.provider_context,
-                usage: self.usage,
-                provider_input: None,
+                provider_context,
+                usage,
+                provider_input,
             }),
-            FinishReasonUnified::ToolCalls if !self.tool_calls.is_empty() => {
-                let mut calls = Vec::with_capacity(self.tool_calls.len());
-                for call in self.tool_calls {
+            FinishReasonUnified::ToolCalls if !tool_calls.is_empty() => {
+                let mut calls = Vec::with_capacity(tool_calls.len());
+                for call in tool_calls {
                     let input = match call.parsed {
+                        Some(Value::String(raw)) => {
+                            serde_json::from_str(&raw).map_err(|error| {
+                                failure("provider.outcome.tool_arguments_json", error.to_string())
+                            })?
+                        }
                         Some(input) => input,
                         None => serde_json::from_str(&call.input).map_err(|error| {
-                            protocol_failure(
-                                "provider.outcome.tool_arguments_json",
-                                error.to_string(),
-                            )
+                            failure("provider.outcome.tool_arguments_json", error.to_string())
                         })?,
                     };
                     if !input.is_object() {
-                        return Err(protocol_failure(
+                        return Err(failure(
                             "provider.outcome.tool_arguments_shape",
-                            "tool arguments are not an object",
+                            "tool arguments are not an object".to_owned(),
                         ));
                     }
-                    calls.push(ToolCall {
+                    calls.push(ProviderToolCall {
                         tool_call_id: call.tool_call_id,
                         tool_name: call.tool_name,
                         arguments: input,
                     });
                 }
                 Ok(ModelOutcome {
-                    text: self.text,
+                    text,
                     tool_calls: calls,
-                    provider_context: self.provider_context,
-                    usage: self.usage,
-                    provider_input: None,
+                    provider_context,
+                    usage,
+                    provider_input,
                 })
+            }
+            FinishReasonUnified::Length | FinishReasonUnified::ContentFilter => {
+                let mut error = failure(
+                    "provider.outcome.finish_reason",
+                    format!("unsupported finish reason: {finish_reason:?}"),
+                );
+                if let ModelError::ProviderFailed(detail) = &mut error {
+                    detail.provider_code = Some(
+                        if finish_reason.unified == FinishReasonUnified::Length {
+                            "max_output_tokens"
+                        } else {
+                            "content_filter"
+                        }
+                        .into(),
+                    );
+                }
+                Err(error)
             }
             FinishReasonUnified::Stop
             | FinishReasonUnified::ToolCalls
             | FinishReasonUnified::Error
-            | FinishReasonUnified::Length
-            | FinishReasonUnified::ContentFilter
-            | FinishReasonUnified::Other => Err(protocol_failure(
+            | FinishReasonUnified::Other => Err(failure(
                 "provider.outcome.finish_reason",
                 format!("unsupported finish reason: {:?}", finish_reason),
             )),
@@ -289,16 +409,26 @@ async fn model_outcome_from_stream_result(
     request: &ModelRequest,
     execution: &ProfileExecution,
     output_items: Option<responses::CapturedOutputItems>,
+    provider_input: ProviderInputDiagnostics,
 ) -> Result<ModelOutcome, ModelError> {
-    let mut outcome = ModelOutcomeAccumulator::default();
+    let mut outcome = ModelOutcomeAccumulator {
+        provider_input: Some(Box::new(provider_input)),
+        ..Default::default()
+    };
     let mut finish_reason = None;
     while let Some(part) = result.stream.next().await {
-        match part.map_err(|error| aimux_failure("provider.stream.read", error))? {
+        let part = match part {
+            Ok(part) => part,
+            Err(error) => {
+                return Err(outcome.attach_failure(aimux_failure("provider.stream.read", error)))
+            }
+        };
+        match part {
             StreamPart::TextDelta { delta, .. } => {
                 request.stream_observer.text_delta(
                     &request.session_id,
-                    &request.activation_id,
-                    &request.round_id,
+                    request.generation,
+                    &request.step_id,
                     &delta,
                 );
                 outcome.text.push_str(&delta);
@@ -314,25 +444,21 @@ async fn model_outcome_from_stream_result(
                 });
             }
             StreamPart::ToolInputDelta { id, delta, .. } => {
-                let call = outcome.tool_call_mut(&id).ok_or_else(|| {
-                    protocol_failure(
+                let Some(call) = outcome.tool_call_mut(&id) else {
+                    return Err(outcome.attach_failure(protocol_failure(
                         "provider.stream.tool_input_delta",
                         "tool input delta has no matching call",
-                    )
-                })?;
+                    )));
+                };
                 call.input.push_str(&delta);
             }
-            StreamPart::ToolInputEnd { id, .. } => {
-                let call = outcome.tool_call_mut(&id).ok_or_else(|| {
-                    protocol_failure(
-                        "provider.stream.tool_input_end",
-                        "tool input end has no matching call",
-                    )
-                })?;
-                call.parsed = Some(serde_json::from_str(&call.input).map_err(|error| {
-                    protocol_failure("provider.stream.tool_arguments_json", error.to_string())
-                })?);
+            StreamPart::ToolInputEnd { id, .. } if outcome.tool_call_mut(&id).is_none() => {
+                return Err(outcome.attach_failure(protocol_failure(
+                    "provider.stream.tool_input_end",
+                    "tool input end has no matching call",
+                )));
             }
+            StreamPart::ToolInputEnd { .. } => {}
             StreamPart::ToolCall {
                 tool_call_id,
                 tool_name,
@@ -341,16 +467,27 @@ async fn model_outcome_from_stream_result(
             } => {
                 if let Some(call) = outcome.tool_call_mut(&tool_call_id) {
                     call.tool_name = tool_name;
-                    call.parsed = Some(input);
+                    match input {
+                        Value::String(raw) => {
+                            call.input = raw;
+                            call.parsed = None;
+                        }
+                        input => call.parsed = Some(input),
+                    }
                 } else {
+                    let (input, parsed) = match input {
+                        Value::String(raw) => (raw, None),
+                        input => (String::new(), Some(input)),
+                    };
                     outcome.tool_calls.push(PendingToolCall {
                         tool_call_id,
                         tool_name,
-                        input: String::new(),
-                        parsed: Some(input),
+                        input,
+                        parsed,
                     });
                 }
             }
+            StreamPart::ResponseMetadata { id, .. } => outcome.observe_response_id(id),
             StreamPart::ReasoningStart { .. } | StreamPart::ReasoningEnd { .. } => {}
             StreamPart::Finish {
                 finish_reason: observed_finish,
@@ -361,36 +498,52 @@ async fn model_outcome_from_stream_result(
                 finish_reason = Some(observed_finish);
             }
             StreamPart::Error { error } => {
-                return Err(aimux_failure("provider.stream.error_event", error))
+                return Err(
+                    outcome.attach_failure(aimux_failure("provider.stream.error_event", error))
+                )
             }
             _ => {}
         }
     }
     if let Some(output_items) = output_items {
-        outcome.provider_context = Some(provider_context_from_output_items(
-            output_items
-                .ordered()
-                .map_err(|error| protocol_failure("provider.output_items", error))?,
-            execution,
-        ));
+        if !output_items.terminal_received() {
+            return Err(outcome.attach_failure(protocol_failure(
+                "provider.stream.finish",
+                "Responses stream ended without a terminal response event",
+            )));
+        }
+        let ordered = output_items.ordered().map_err(|error| {
+            outcome.attach_failure(protocol_failure("provider.output_items", error))
+        })?;
+        outcome.provider_context = Some(provider_context_from_output_items(ordered, execution));
     }
-    outcome.complete(finish_reason.ok_or_else(|| {
-        protocol_failure(
+    let Some(finish_reason) = finish_reason else {
+        return Err(outcome.attach_failure(protocol_failure(
             "provider.stream.finish",
             "provider stream ended without a finish event",
-        )
-    })?)
+        )));
+    };
+    if execution.api() == "openai-completions" && finish_reason.raw.is_none() {
+        return Err(outcome.attach_failure(protocol_failure(
+            "provider.stream.finish",
+            "provider stream ended without an explicit finish reason",
+        )));
+    }
+    outcome.complete(finish_reason)
 }
 
 fn model_outcome_from_generate_result(
     result: GenerateResult,
     execution: &ProfileExecution,
     output_items: Option<std::sync::Arc<Vec<Value>>>,
+    provider_input: ProviderInputDiagnostics,
 ) -> Result<ModelOutcome, ModelError> {
     let mut outcome = ModelOutcomeAccumulator {
         usage: model_token_usage(&result.usage),
+        provider_input: Some(Box::new(provider_input)),
         ..Default::default()
     };
+    outcome.observe_response_id(result.response.id.clone());
     for content in result.content {
         match content {
             GenerateContent::Text { text, .. } => outcome.text.push_str(&text),
@@ -431,16 +584,17 @@ fn provider_context_from_output_items(
     }
 }
 
-fn model_token_usage(usage: &Usage) -> Option<zork_agent::session::runtime::ModelTokenUsage> {
-    usage.input_tokens.total.map(
-        |input_tokens| zork_agent::session::runtime::ModelTokenUsage {
+fn model_token_usage(usage: &Usage) -> Option<zork_agent::session::model::ModelTokenUsage> {
+    usage
+        .input_tokens
+        .total
+        .map(|input_tokens| zork_agent::session::model::ModelTokenUsage {
             input_tokens: u64::from(input_tokens),
             cached_input_tokens: usage.input_tokens.cache_read.map(u64::from),
             output_tokens: u64::from(usage.output_tokens.total.unwrap_or(0)),
             output_reasoning_tokens: usage.output_tokens.reasoning.map(u64::from),
             output_text_tokens: usage.output_tokens.text.map(u64::from),
-        },
-    )
+        })
 }
 
 fn reasoning_effort(value: &str) -> ReasoningEffort {
@@ -624,6 +778,7 @@ mod tests {
     use super::*;
 
     #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, RETRY-02]
     fn aimux_failure_preserves_structured_diagnostics_without_raw_body() {
         let error = AiMuxError::ApiCall(aimux_core::ApiCallError {
             status_code: Some(429),
@@ -652,23 +807,184 @@ mod tests {
         assert!(!failure.message.contains("raw body must not be copied"));
     }
 
-    fn responses_execution(streaming: bool) -> ProfileExecution {
+    fn execution(api: &str, streaming: bool) -> ProfileExecution {
         ProfileExecution::new(
             "profile".to_owned(),
             "openai".to_owned(),
             "gpt-5.6-luna".to_owned(),
-            "openai-responses".to_owned(),
+            api.to_owned(),
             streaming,
             false,
             None,
             "https://example.invalid".to_owned(),
             HashMap::new(),
             "max".to_owned(),
+            zork_agent::session::ports::ModelLimits {
+                context_window_tokens: 1_000_000,
+                max_output_tokens: 128_000,
+                reserve_percent: 10,
+            },
             "secret".to_owned(),
         )
     }
 
+    fn stream_request_fixture() -> ModelRequest {
+        ModelRequest {
+            session_id: "session".to_owned(),
+            generation: 0,
+            step_id: "step".to_owned(),
+            selection: zork_agent::session::wire::SessionSelection {
+                profile_id: "profile".to_owned(),
+                model: "gpt-5.6-luna".to_owned(),
+                thinking: "max".to_owned(),
+            },
+            transcript: std::sync::Arc::new(Vec::new()),
+            tools: std::sync::Arc::new(Vec::new()),
+            max_output_tokens: Some(128_000),
+            independent: false,
+            stream_observer: std::sync::Arc::new(zork_agent::session::model::SilentStreamObserver),
+        }
+    }
+
+    fn stream_result(parts: Vec<StreamPart>) -> StreamResult {
+        StreamResult {
+            stream: Box::pin(futures_util::stream::iter(
+                parts.into_iter().map(Ok::<_, AiMuxError>),
+            )),
+            request_body: None,
+            response_headers: None,
+        }
+    }
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input_tokens: aimux_core::types::TokenUsage {
+                total: Some(input),
+                ..Default::default()
+            },
+            output_tokens: aimux_core::types::TokenUsage {
+                total: Some(output),
+                reasoning: Some(output),
+                ..Default::default()
+            },
+            raw: None,
+        }
+    }
+
+    #[tokio::test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, RETRY-02]
+    async fn incomplete_tool_stream_keeps_request_and_usage_without_a_false_json_error() {
+        let partial = r#"{"tool":"file.read","arguments":{"path":"/tmp"#;
+        let result = stream_result(vec![
+            StreamPart::ResponseMetadata {
+                id: Some("response-123".to_owned()),
+                timestamp: None,
+                model_id: None,
+            },
+            StreamPart::ToolInputStart {
+                id: "call-1".to_owned(),
+                tool_name: "call".to_owned(),
+                provider_executed: None,
+                dynamic: None,
+                title: None,
+                provider_metadata: None,
+            },
+            StreamPart::ToolInputDelta {
+                id: "call-1".to_owned(),
+                delta: partial.to_owned(),
+                provider_metadata: None,
+            },
+            StreamPart::ToolInputEnd {
+                id: "call-1".to_owned(),
+                provider_metadata: None,
+            },
+            StreamPart::ToolCall {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "call".to_owned(),
+                input: Value::String(partial.to_owned()),
+                provider_executed: None,
+                dynamic: None,
+                thought_signature: None,
+                provider_metadata: None,
+            },
+            StreamPart::Finish {
+                finish_reason: FinishReason {
+                    unified: FinishReasonUnified::Stop,
+                    raw: None,
+                },
+                usage: usage(321, 45),
+                provider_metadata: None,
+            },
+        ]);
+
+        let error = model_outcome_from_stream_result(
+            result,
+            &stream_request_fixture(),
+            &execution("openai-completions", true),
+            None,
+            full_input_diagnostics(4, 5),
+        )
+        .await
+        .expect_err("missing finish reason must fail");
+        let ModelError::ProviderFailed(failure) = error else {
+            panic!("expected provider failure");
+        };
+        assert_eq!(failure.stage, "provider.stream.finish");
+        assert!(!failure.message.contains("EOF while parsing"));
+        let input = failure.provider_input.expect("provider input");
+        assert_eq!(input.logical_input_items, 4);
+        assert_eq!(input.sent_input_items, 5);
+        assert_eq!(input.response_id.as_deref(), Some("response-123"));
+        let usage = failure.usage.expect("observed usage");
+        assert_eq!(usage.input_tokens, 321);
+        assert_eq!(usage.output_tokens, 45);
+    }
+
+    #[tokio::test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, RETRY-02]
+    async fn transport_error_after_tool_input_end_is_not_masked_by_partial_json() {
+        let result = stream_result(vec![
+            StreamPart::ToolInputStart {
+                id: "call-1".to_owned(),
+                tool_name: "call".to_owned(),
+                provider_executed: None,
+                dynamic: None,
+                title: None,
+                provider_metadata: None,
+            },
+            StreamPart::ToolInputDelta {
+                id: "call-1".to_owned(),
+                delta: "{".to_owned(),
+                provider_metadata: None,
+            },
+            StreamPart::ToolInputEnd {
+                id: "call-1".to_owned(),
+                provider_metadata: None,
+            },
+            StreamPart::Error {
+                error: AiMuxError::InvalidResponseData("transport reset".to_owned()),
+            },
+        ]);
+
+        let error = model_outcome_from_stream_result(
+            result,
+            &stream_request_fixture(),
+            &execution("openai-completions", true),
+            None,
+            full_input_diagnostics(2, 2),
+        )
+        .await
+        .expect_err("transport error must fail");
+        let ModelError::ProviderFailed(failure) = error else {
+            panic!("expected provider failure");
+        };
+        assert_eq!(failure.stage, "provider.stream.error_event");
+        assert!(failure.message.contains("transport reset"));
+        assert_eq!(failure.provider_input.unwrap().sent_input_items, 2);
+    }
+
     #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01]
     fn non_streaming_result_preserves_the_streaming_outcome_contract() {
         let result = aimux_core::result::GenerateResult {
             content: vec![
@@ -745,8 +1061,9 @@ mod tests {
         ]);
         let outcome = model_outcome_from_generate_result(
             result,
-            &responses_execution(false),
+            &execution("openai-responses", false),
             Some(output_items.clone()),
+            full_input_diagnostics(1, 1),
         )
         .expect("valid non-streaming result");
 
@@ -772,6 +1089,7 @@ mod tests {
     }
 
     #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01]
     fn non_streaming_responses_accepts_plain_raw_reasoning() {
         let result = aimux_core::result::GenerateResult {
             content: vec![aimux_core::result::GenerateContent::Reasoning {
@@ -802,8 +1120,9 @@ mod tests {
         })]);
         let outcome = model_outcome_from_generate_result(
             result,
-            &responses_execution(false),
+            &execution("openai-responses", false),
             Some(plain.clone()),
+            full_input_diagnostics(1, 1),
         )
         .expect("plain reasoning is replayable as a raw output item");
 
@@ -814,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    // Contract: docs/zork-agent-architecture.md [PROVIDER-01, PROVIDER-03]
     fn responses_options_preserve_profile_defined_reasoning_exactly() {
         let options = responses_provider_options("future-depth");
 

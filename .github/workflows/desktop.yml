@@ -1,0 +1,52 @@
+name: Desktop
+
+on:
+  pull_request:
+    paths:
+      - "crates/zork-gui/src/**"
+      - "crates/zork-gui/tests/*.rs"
+      - "crates/zork-gui/assets/**"
+      - "crates/zork-gui/Cargo.toml"
+      - "crates/zork-config/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/zork-gui/src/**"
+      - "crates/zork-gui/tests/*.rs"
+      - "crates/zork-gui/assets/**"
+      - "crates/zork-gui/Cargo.toml"
+      - "crates/zork-config/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Native desktop tests
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up kache build cache
+        uses: kunobi-ninja/kache-action@v1
+        with:
+          s3-bucket: zork-kache
+          s3-region: auto
+          s3-endpoint: https://17b387559836c2d9941e2bf7dc01aba4.r2.cloudflarestorage.com
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+      - run: cargo test --locked -p zork-gui

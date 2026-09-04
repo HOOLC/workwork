@@ -1,3 +1,4 @@
+import { verifyContextConfiguration } from "./testkit/context-contract.js";
 import fs from "node:fs/promises";
 import http, { type ServerResponse } from "node:http";
 import os from "node:os";
@@ -6,183 +7,14 @@ import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
-import { brokerRoot, getFreePort, removeTempRoot, spawnAgent, spawnBinary, stopChild, waitFor, waitForReady, writeConfig } from "./helpers.js";
+import { brokerRoot, getFreePort, removeTempRoot, spawnAgent, spawnBinary, stopChild, testConnectionId, testNormalWorkspace, testSessionKey, testSlackConnection, waitFor, waitForReady, writeConfig } from "./helpers.js";
+import { controlledAgentToken as agentToken, ControlledAgent } from "./testkit/controlled-agent.js";
 import { MockSlackServer } from "./helpers/mock-slack-server.js";
-
-const agentToken = "controlled-agent-token";
 
 type PendingModelRequest = {
   body: { messages?: Array<{ role?: string; content?: unknown }> };
   response: ServerResponse;
 };
-
-type PendingMailboxAppend = {
-  readonly sessionId: string;
-  readonly body: { content?: string };
-  readonly response: ServerResponse;
-};
-
-class ControlledMailboxAgent {
-  readonly appends: PendingMailboxAppend[] = [];
-  readonly creates: Array<Record<string, unknown>> = [];
-  readonly selectionUpdates: Array<{ sessionId: string; selection: Record<string, unknown> }> = [];
-  readonly profileWrites: Array<{ profileId: string; document: Record<string, unknown> }> = [];
-  readonly profileDeletes: string[] = [];
-  readonly sessions = new Map<string, Record<string, unknown>>();
-  readonly profiles: Array<Record<string, unknown>>;
-  createFailure: { readonly status: number; readonly message: string } | null = null;
-
-  constructor(
-    profiles: Array<Record<string, unknown>> = [
-      {
-        profile_id: "fixture",
-        provider: "xai",
-        auth_configured: true,
-        models: [
-          {
-            id: "grok-4.6",
-            api: "openai-completions",
-            streaming: true,
-            thinking: ["high", "xhigh"],
-            default_thinking: "xhigh",
-            capabilities: { input: ["text", "image"] },
-            default: true,
-          },
-        ],
-      },
-    ],
-  ) {
-    this.profiles = profiles;
-  }
-
-  readonly server = http.createServer(async (request, response) => {
-    if (request.headers.authorization !== `Bearer ${agentToken}`) {
-      response.writeHead(401).end();
-      return;
-    }
-    const url = request.url ?? "";
-    if (request.method === "GET" && url === "/v1/profiles") {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ items: this.profiles }));
-      return;
-    }
-    const profilePath = /^\/v1\/profiles\/([^/]+)$/.exec(url);
-    if (request.method === "PUT" && profilePath) {
-      const profileId = decodeURIComponent(profilePath[1]);
-      const document = (await readJsonRequest(request)) as Record<string, unknown>;
-      if (profileId === "invalid") {
-        response.writeHead(422, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { code: "invalid_request", message: "invalid profile" } }));
-        return;
-      }
-      this.profileWrites.push({ profileId, document });
-      const view = {
-        profile_id: profileId,
-        provider: document.provider,
-        billing: document.billing,
-        auth_configured: Boolean(document.auth && Object.keys(document.auth as object).length),
-        models: document.models,
-      };
-      const existing = this.profiles.findIndex((profile) => profile.profile_id === profileId);
-      if (existing >= 0) this.profiles.splice(existing, 1, view);
-      else this.profiles.push(view);
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(view));
-      return;
-    }
-    if (request.method === "DELETE" && profilePath) {
-      const profileId = decodeURIComponent(profilePath[1]);
-      this.profileDeletes.push(profileId);
-      const existing = this.profiles.findIndex((profile) => profile.profile_id === profileId);
-      if (existing >= 0) this.profiles.splice(existing, 1);
-      response.writeHead(204).end();
-      return;
-    }
-    if (request.method === "GET" && /^\/v1\/sessions\/[^/]+$/.test(url)) {
-      const sessionId = decodeURIComponent(url.slice("/v1/sessions/".length));
-      const session = this.sessions.get(sessionId);
-      response.writeHead(session ? 200 : 404, { "content-type": "application/json" });
-      response.end(JSON.stringify(session ?? { error: { message: "session not found" } }));
-      return;
-    }
-    if (request.method === "POST" && url === "/v1/sessions") {
-      const body = (await readJsonRequest(request)) as Record<string, unknown>;
-      this.creates.push(body);
-      if (this.createFailure) {
-        response.writeHead(this.createFailure.status, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { code: "invalid_request", message: this.createFailure.message } }));
-        return;
-      }
-      const sessionId = `01ARZ3NDEKTSV4RRFFQ69G5FA${this.creates.length.toString(32).toUpperCase()}`;
-      const session = { session_id: sessionId, ...body, status: "wait" };
-      this.sessions.set(sessionId, session);
-      response.writeHead(201, { "content-type": "application/json" });
-      response.end(JSON.stringify(session));
-      return;
-    }
-    const selectionPath = /^\/v1\/sessions\/([^/]+)\/selection$/.exec(url);
-    if (request.method === "PUT" && selectionPath) {
-      const sessionId = decodeURIComponent(selectionPath[1]);
-      const selection = (await readJsonRequest(request)) as Record<string, unknown>;
-      const session = this.sessions.get(sessionId);
-      if (!session) {
-        response.writeHead(404, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: "session not found" } }));
-        return;
-      }
-      this.selectionUpdates.push({ sessionId, selection });
-      const updated = { ...session, ...selection };
-      this.sessions.set(sessionId, updated);
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(updated));
-      return;
-    }
-    const mailbox = /^\/v1\/sessions\/([^/]+)\/mailbox$/.exec(url);
-    if (request.method === "POST" && mailbox) {
-      this.appends.push({
-        sessionId: decodeURIComponent(mailbox[1]),
-        body: (await readJsonRequest(request)) as { content?: string },
-        response,
-      });
-      return;
-    }
-    response.writeHead(404).end();
-  });
-
-  async start(port: number): Promise<void> {
-    await new Promise<void>((resolve) => this.server.listen(port, "127.0.0.1", resolve));
-  }
-
-  async waitForAppend(count: number): Promise<PendingMailboxAppend> {
-    return await waitFor(
-      () => this.appends[count - 1],
-      (append): append is PendingMailboxAppend => Boolean(append),
-      `Agent mailbox append ${count}`,
-    );
-  }
-
-  async waitForCreate(count: number): Promise<Record<string, unknown>> {
-    return await waitFor(
-      () => this.creates[count - 1],
-      (create): create is Record<string, unknown> => Boolean(create),
-      `Agent session create ${count}`,
-    );
-  }
-
-  accept(count: number): void {
-    const append = this.appends[count - 1];
-    if (!append) throw new Error(`missing mailbox append ${count}`);
-    append.response.writeHead(202);
-    append.response.end();
-  }
-
-  async stop(): Promise<void> {
-    for (const [index, append] of this.appends.entries()) {
-      if (!append.response.writableEnded) this.accept(index + 1);
-    }
-    await new Promise<void>((resolve) => this.server.close(() => resolve()));
-  }
-}
 
 class ControlledProvider {
   readonly requests: PendingModelRequest[] = [];
@@ -260,6 +92,186 @@ describe.sequential("Gateway mailbox delivery", () => {
     while (cleanups.length > 0) await cleanups.pop()?.();
   });
 
+  it("routes every observed Slack message to one proactive Agent session without replying automatically", { timeout: 30_000 }, async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "zork-gateway-proactive-"));
+    cleanups.push(async () => removeTempRoot(tempRoot));
+    const slack = new MockSlackServer("UBOT", { botId: "BBOT", appId: "AAPP" });
+    const slackPort = await slack.start();
+    cleanups.push(async () => slack.stop());
+    const gatewayPort = await getFreePort();
+    const runtimePort = await getFreePort();
+    const adminPort = await getFreePort();
+    const agentPort = await getFreePort();
+    const agent = new ControlledAgent();
+    await agent.start(agentPort);
+    cleanups.push(async () => agent.stop());
+    await writeConfig(tempRoot, {
+      im_connections: [testSlackConnection(slackPort, "proactive")],
+      bind: {
+        gateway: `127.0.0.1:${gatewayPort}`,
+        runtime: `127.0.0.1:${runtimePort}`,
+        control: `127.0.0.1:${adminPort}`,
+        agent: `127.0.0.1:${agentPort}`,
+      },
+    });
+    const gateway = spawnBinary("zork-gateway", {
+      cwd: brokerRoot,
+      args: ["--data", tempRoot, "--fake-agent", "--agent-token", agentToken],
+    });
+    cleanups.push(async () => stopChild(gateway));
+    await waitForReady(`http://127.0.0.1:${runtimePort}/readyz`, "proactive Gateway readyz");
+    await slack.waitForSocket();
+
+    await slack.sendEvent("evt-proactive-root", {
+      type: "message",
+      user: "U-FIRST",
+      channel: "C-FIRST",
+      channel_type: "channel",
+      ts: "100.001",
+      text: "A root channel message that did not mention the bot",
+    });
+    const first = await agent.waitForAppend(1);
+    const create = await agent.waitForCreate(1);
+    expect(create.workspace).toBe(path.join(tempRoot, "workspaces", "im", testConnectionId, "proactive"));
+    expect(create.system_prompt).toEqual(expect.stringContaining("Do not reply unless all three conditions are true"));
+    expect(create.system_prompt).toEqual(expect.stringContaining("zork-call slack post-message"));
+    expect(first.body.content).toContain('"channel_id": "C-FIRST"');
+    expect(first.body.content).toContain('"thread_ts": "100.001"');
+    first.respond();
+    await waitFor(
+      () => slack.acknowledgedEnvelopeIds,
+      (ids) => ids.includes("env-evt-proactive-root"),
+      "first proactive Slack acknowledgement",
+    );
+
+    await slack.sendEvent("evt-proactive-thread", {
+      type: "message",
+      user: "U-SECOND",
+      channel: "C-SECOND",
+      channel_type: "channel",
+      thread_ts: "200.001",
+      ts: "200.002",
+      text: "A reply in a different channel and thread",
+    });
+    const second = await agent.waitForAppend(2);
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(second.body.content).toContain('"channel_id": "C-SECOND"');
+    expect(second.body.content).toContain('"thread_ts": "200.001"');
+    expect(agent.creates).toHaveLength(1);
+    second.respond();
+    await waitFor(
+      () => slack.acknowledgedEnvelopeIds,
+      (ids) => ids.includes("env-evt-proactive-thread"),
+      "second proactive Slack acknowledgement",
+    );
+
+    await slack.sendEvent("evt-proactive-duplicate", {
+      type: "app_mention",
+      user: "U-FIRST",
+      channel: "C-FIRST",
+      ts: "100.001",
+      text: "<@UBOT> duplicate delivery of the same Slack message",
+    });
+    await waitFor(
+      () => slack.acknowledgedEnvelopeIds,
+      (ids) => ids.includes("env-evt-proactive-duplicate"),
+      "duplicate proactive Slack acknowledgement",
+    );
+    expect(agent.appends).toHaveLength(2);
+
+    await stopChild(gateway);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const restartedGateway = spawnBinary("zork-gateway", {
+      cwd: brokerRoot,
+      args: ["--data", tempRoot, "--fake-agent", "--agent-token", agentToken],
+    });
+    cleanups.push(async () => stopChild(restartedGateway));
+    await waitForReady(`http://127.0.0.1:${runtimePort}/readyz`, "restarted proactive Gateway readyz");
+    await slack.waitForSocket();
+
+    await slack.sendEvent("evt-proactive-other-bot", {
+      type: "message",
+      bot_id: "B-OTHER",
+      app_id: "A-OTHER",
+      username: "other-bot",
+      channel: "C-THIRD",
+      channel_type: "channel",
+      ts: "300.001",
+      text: "a message from another bot",
+    });
+    const third = await agent.waitForAppend(3);
+    expect(third.sessionId).toBe(first.sessionId);
+    expect(third.body.content).toContain('"kind": "bot"');
+    expect(agent.creates).toHaveLength(1);
+    third.respond();
+    await waitFor(
+      () => slack.acknowledgedEnvelopeIds,
+      (ids) => ids.includes("env-evt-proactive-other-bot"),
+      "other bot proactive Slack acknowledgement",
+    );
+
+    await slack.sendEvent("evt-proactive-self", {
+      type: "message",
+      user: "UBOT",
+      bot_id: "BBOT",
+      app_id: "AAPP",
+      channel: "C-FIRST",
+      channel_type: "channel",
+      ts: "100.003",
+      text: "the proactive bot's own message",
+    });
+    await waitFor(
+      () => slack.acknowledgedEnvelopeIds,
+      (ids) => ids.includes("env-evt-proactive-self"),
+      "self-authored Slack acknowledgement",
+    );
+    expect(agent.appends).toHaveLength(3);
+    expect(slack.postedMessages).toHaveLength(0);
+    expect(slack.assistantStatusUpdates).toHaveLength(0);
+
+    const snapshot = (await fetch(`http://127.0.0.1:${runtimePort}/internal/realtime/snapshot`).then((response) => response.json())) as Record<string, any>;
+    expect(snapshot.state.proactive).toBeUndefined();
+    expect(snapshot.state.sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: testConnectionId,
+          id: first.sessionId,
+          connectionId: testConnectionId,
+          platform: "slack",
+          mode: "proactive",
+          channelLabel: "多个对话",
+        }),
+      ]),
+    );
+
+    const timeline = await fetch(`http://127.0.0.1:${runtimePort}/internal/realtime/sessions/${encodeURIComponent(testConnectionId)}/timeline?limit=20`);
+    expect(timeline.status).toBe(200);
+    await expect(timeline.json()).resolves.toMatchObject({
+      session: { key: testConnectionId, mode: "proactive" },
+      events: expect.arrayContaining([expect.objectContaining({ type: "inbound_message", conversationId: "C-SECOND" })]),
+    });
+
+    const context = await fetch(`http://127.0.0.1:${runtimePort}/cli/context?cwd=${encodeURIComponent(String(create.workspace))}`);
+    expect(context.status).toBe(200);
+    await expect(context.json()).resolves.toMatchObject({
+      connectionId: testConnectionId,
+      sessionKey: testConnectionId,
+      platform: "slack",
+      mode: "proactive",
+    });
+
+    const selection = await fetch(`http://127.0.0.1:${adminPort}/admin/api/sessions/${encodeURIComponent(testConnectionId)}/selection`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profile_id: "fixture", model: "grok-4.6", thinking: "xhigh" }),
+    });
+    expect(selection.status).toBe(200);
+    await expect(selection.json()).resolves.toMatchObject({
+      selection: { profile_id: "fixture", model: "grok-4.6", thinking: "xhigh" },
+      session: { key: testConnectionId, mode: "proactive" },
+    });
+  });
+
   it("exposes Agent-owned profiles to Admin without a Gateway profile store", { timeout: 30_000 }, async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "zork-gateway-profile-proxy-"));
     cleanups.push(async () => removeTempRoot(tempRoot));
@@ -270,15 +282,11 @@ describe.sequential("Gateway mailbox delivery", () => {
     const runtimePort = await getFreePort();
     const adminPort = await getFreePort();
     const agentPort = await getFreePort();
-    const agent = new ControlledMailboxAgent();
+    const agent = new ControlledAgent();
     await agent.start(agentPort);
     cleanups.push(async () => agent.stop());
     await writeConfig(tempRoot, {
-      slack: {
-        app_token: "xapp-test",
-        bot_token: "xoxb-test",
-        api_base_url: `http://127.0.0.1:${slackPort}/api`,
-      },
+      im_connections: [testSlackConnection(slackPort)],
       bind: {
         gateway: `127.0.0.1:${gatewayPort}`,
         runtime: `127.0.0.1:${runtimePort}`,
@@ -307,6 +315,7 @@ describe.sequential("Gateway mailbox delivery", () => {
           id: "gpt-admin",
           api: "openai-completions",
           streaming: true,
+          parallel_tool_calls: false,
           thinking: ["off", "high"],
           default_thinking: "high",
           capabilities: { input: ["text"] },
@@ -358,7 +367,7 @@ describe.sequential("Gateway mailbox delivery", () => {
         default: true,
       },
     ];
-    const agent = new ControlledMailboxAgent([
+    const agent = new ControlledAgent([
       {
         profile_id: "subscription",
         provider: "xai",
@@ -381,11 +390,7 @@ describe.sequential("Gateway mailbox delivery", () => {
     await agent.start(agentPort);
     cleanups.push(async () => agent.stop());
     await writeConfig(tempRoot, {
-      slack: {
-        app_token: "xapp-test",
-        bot_token: "xoxb-test",
-        api_base_url: `http://127.0.0.1:${slackPort}/api`,
-      },
+      im_connections: [testSlackConnection(slackPort)],
       bind: {
         gateway: `127.0.0.1:${gatewayPort}`,
         runtime: `127.0.0.1:${runtimePort}`,
@@ -411,41 +416,56 @@ describe.sequential("Gateway mailbox delivery", () => {
       text: "<@UBOT> create selection session",
     });
     await agent.waitForCreate(1);
-    await agent.waitForAppend(1);
-    agent.accept(1);
+    const initialAppend = await agent.waitForAppend(1);
+    initialAppend.respond();
 
     const adminBaseUrl = `http://127.0.0.1:${adminPort}`;
-    const explicit = await fetch(`${adminBaseUrl}/admin/api/sessions/${encodeURIComponent("C-SELECTION:820.100")}/selection`, {
+    const selectionKey = testSessionKey("C-SELECTION", "820.100");
+    const contextUrl = `${adminBaseUrl}/admin/api/sessions/${encodeURIComponent(selectionKey)}/context`;
+    await verifyContextConfiguration(contextUrl, agent, initialAppend.sessionId);
+    const explicit = await fetch(`${adminBaseUrl}/admin/api/sessions/${encodeURIComponent(selectionKey)}/selection`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ profile_id: "usage", model: "grok-4.6", thinking: "high" }),
     });
     expect(explicit.status).toBe(200);
-    expect((await explicit.json()).selection).toEqual({ profile_id: "usage", model: "grok-4.6", thinking: "high" });
+    expect((await explicit.json()).selection).toEqual({
+      profile_id: "usage",
+      model: "grok-4.6",
+      thinking: "high",
+    });
 
-    const automatic = await fetch(`${adminBaseUrl}/admin/api/sessions/${encodeURIComponent("C-SELECTION:820.100")}/selection`, {
+    const automatic = await fetch(`${adminBaseUrl}/admin/api/sessions/${encodeURIComponent(selectionKey)}/selection`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ profile_id: "auto", model: "grok-4.6", thinking: "high" }),
     });
     expect(automatic.status).toBe(200);
-    expect((await automatic.json()).selection).toEqual({ profile_id: "subscription", model: "grok-4.6", thinking: "high" });
+    expect((await automatic.json()).selection).toEqual({
+      profile_id: "subscription",
+      model: "grok-4.6",
+      thinking: "high",
+    });
     expect(agent.selectionUpdates.map((update) => update.selection)).toEqual([
       { profile_id: "usage", model: "grok-4.6", thinking: "high" },
       { profile_id: "subscription", model: "grok-4.6", thinking: "high" },
     ]);
 
     const gatewayDb = new DatabaseSync(path.join(tempRoot, "state", "gateway.sqlite"));
-    gatewayDb.prepare("UPDATE sessions SET id = NULL WHERE key = ?").run("C-SELECTION:820.100");
+    gatewayDb.prepare("UPDATE sessions SET id = NULL WHERE key = ?").run(selectionKey);
     gatewayDb.close();
+    expect((await fetch(contextUrl)).status).toBe(409);
     agent.createFailure = { status: 422, message: "selection disappeared" };
-    const rejectedFreshSelection = await fetch(`${adminBaseUrl}/admin/api/sessions/${encodeURIComponent("C-SELECTION:820.100")}/selection`, {
+    const rejectedFreshSelection = await fetch(`${adminBaseUrl}/admin/api/sessions/${encodeURIComponent(selectionKey)}/selection`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ profile_id: "usage", model: "grok-4.6", thinking: "high" }),
     });
     expect(rejectedFreshSelection.status).toBe(422);
-    expect(await rejectedFreshSelection.json()).toEqual({ ok: false, error: "selection disappeared" });
+    expect(await rejectedFreshSelection.json()).toEqual({
+      ok: false,
+      error: "selection disappeared",
+    });
   });
 
   it("acknowledges a Slack envelope only after the Agent durably accepts its mailbox message", { timeout: 30_000 }, async () => {
@@ -458,19 +478,17 @@ describe.sequential("Gateway mailbox delivery", () => {
 
     const gatewayPort = await getFreePort();
     const runtimePort = await getFreePort();
+    const adminPort = await getFreePort();
     const agentPort = await getFreePort();
-    const agent = new ControlledMailboxAgent();
+    const agent = new ControlledAgent();
     await agent.start(agentPort);
     cleanups.push(async () => agent.stop());
     await writeConfig(tempRoot, {
-      slack: {
-        app_token: "xapp-test",
-        bot_token: "xoxb-test",
-        api_base_url: `http://127.0.0.1:${slackPort}/api`,
-      },
+      im_connections: [testSlackConnection(slackPort)],
       bind: {
         gateway: `127.0.0.1:${gatewayPort}`,
         runtime: `127.0.0.1:${runtimePort}`,
+        control: `127.0.0.1:${adminPort}`,
         agent: `127.0.0.1:${agentPort}`,
       },
     });
@@ -482,6 +500,7 @@ describe.sequential("Gateway mailbox delivery", () => {
     await waitForReady(`http://127.0.0.1:${runtimePort}/readyz`, "Gateway broker readyz");
     await slack.waitForSocket();
 
+    const ackSessionKey = testSessionKey("C-ACK", "800.100");
     await slack.sendEvent("evt-mailbox-ack", {
       type: "app_mention",
       user: "U123",
@@ -490,20 +509,23 @@ describe.sequential("Gateway mailbox delivery", () => {
       ts: "800.101",
       text: "<@UBOT> append before ack",
     });
-    expect(await agent.waitForCreate(1)).toEqual({
+    const created = await agent.waitForCreate(1);
+    expect(created).toEqual({
+      context: null,
       profile_id: "fixture",
       model: "grok-4.6",
       thinking: "xhigh",
-      system_prompt: expect.stringContaining("Slack"),
-      workspace: path.join(tempRoot, "workspaces", "slack", "C-ACK", "800.100"),
+      system_prompt: expect.stringContaining("one IM conversation"),
+      workspace: testNormalWorkspace(tempRoot, "C-ACK", "800.100"),
     });
+    expect(created.system_prompt).toContain("zork-call chat post-message");
     const firstAppend = await agent.waitForAppend(1);
     expect(Object.keys(firstAppend.body)).toEqual(["content"]);
     expect(firstAppend.body.content).toContain("append before ack");
     expect(firstAppend.sessionId).toBe("01ARZ3NDEKTSV4RRFFQ69G5FA1");
     expect(slack.acknowledgedEnvelopeIds).not.toContain("env-evt-mailbox-ack");
 
-    agent.accept(1);
+    firstAppend.respond();
     await waitFor(
       () => slack.acknowledgedEnvelopeIds,
       (ids) => ids.includes("env-evt-mailbox-ack"),
@@ -515,8 +537,7 @@ describe.sequential("Gateway mailbox delivery", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        conversationId: "C-ACK",
-        rootMessageId: "800.100",
+        sessionKey: ackSessionKey,
         text: "background result",
       }),
     }).then((response) => {
@@ -527,31 +548,29 @@ describe.sequential("Gateway mailbox delivery", () => {
     expect(Object.keys(pendingNotify.body)).toEqual(["content"]);
     expect(pendingNotify.body.content).toContain("background result");
     expect(notifyResolved).toBe(false);
-    agent.accept(2);
+    pendingNotify.respond();
     expect((await notify).status).toBe(200);
 
     const secondNotify = fetch(`http://127.0.0.1:${runtimePort}/notify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        conversationId: "C-ACK",
-        rootMessageId: "800.100",
+        sessionKey: ackSessionKey,
         text: "another background result",
       }),
     });
     const secondPendingNotify = await agent.waitForAppend(3);
     expect(Object.keys(secondPendingNotify.body)).toEqual(["content"]);
     expect(secondPendingNotify.body.content).toContain("another background result");
-    agent.accept(3);
+    secondPendingNotify.respond();
     expect((await secondNotify).status).toBe(200);
-    expect(readInboundSources(stateDir, "C-ACK:800.100")).toEqual(["app_mention"]);
+    expect(readInboundSources(stateDir, ackSessionKey)).toEqual(["app_mention"]);
 
     const missingTarget = await fetch(`http://127.0.0.1:${runtimePort}/notify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        conversationId: "C-MISSING",
-        rootMessageId: "999.100",
+        sessionKey: testSessionKey("C-MISSING", "999.100"),
         text: "must not be reported as delivered",
       }),
     });
@@ -562,8 +581,7 @@ describe.sequential("Gateway mailbox delivery", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         jobId: "job-that-does-not-exist",
-        conversationId: "C-ACK",
-        rootMessageId: "800.100",
+        sessionKey: ackSessionKey,
         text: "must not be appended without its owning job",
       }),
     });
@@ -572,9 +590,7 @@ describe.sequential("Gateway mailbox delivery", () => {
 
     insertBackgroundJob(stateDir, {
       id: "job-owned-by-ack-session",
-      sessionKey: "C-ACK:800.100",
-      channelId: "C-ACK",
-      rootMessageId: "800.100",
+      sessionKey: ackSessionKey,
       workspacePath: tempRoot,
     });
     const mismatchedJobTarget = await fetch(`http://127.0.0.1:${runtimePort}/notify`, {
@@ -582,8 +598,7 @@ describe.sequential("Gateway mailbox delivery", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         jobId: "job-owned-by-ack-session",
-        conversationId: "C-OTHER",
-        rootMessageId: "999.200",
+        sessionKey: testSessionKey("C-OTHER", "999.200"),
         text: "must not escape the job-owned session",
       }),
     });
@@ -603,19 +618,17 @@ describe.sequential("Gateway mailbox delivery", () => {
 
     const gatewayPort = await getFreePort();
     const runtimePort = await getFreePort();
+    const adminPort = await getFreePort();
     const agentPort = await getFreePort();
-    const agent = new ControlledMailboxAgent([]);
+    const agent = new ControlledAgent([]);
     await agent.start(agentPort);
     cleanups.push(async () => agent.stop());
     await writeConfig(tempRoot, {
-      slack: {
-        app_token: "xapp-test",
-        bot_token: "xoxb-test",
-        api_base_url: `http://127.0.0.1:${slackPort}/api`,
-      },
+      im_connections: [testSlackConnection(slackPort)],
       bind: {
         gateway: `127.0.0.1:${gatewayPort}`,
         runtime: `127.0.0.1:${runtimePort}`,
+        control: `127.0.0.1:${adminPort}`,
         agent: `127.0.0.1:${agentPort}`,
       },
     });
@@ -636,7 +649,7 @@ describe.sequential("Gateway mailbox delivery", () => {
       text: "<@UBOT> this input has no auth profile",
     });
     await waitFor(
-      () => readInboundStatus(stateDir, "C-AUTH-BLOCK:810.100", "810.101"),
+      () => readInboundStatus(stateDir, testSessionKey("C-AUTH-BLOCK", "810.100"), "810.101"),
       (status) => status === "blocked",
       "auth-blocked inbound audit",
     );
@@ -661,19 +674,17 @@ describe.sequential("Gateway mailbox delivery", () => {
     cleanups.push(async () => slack.stop());
     const gatewayPort = await getFreePort();
     const runtimePort = await getFreePort();
+    const adminPort = await getFreePort();
     const agentPort = await getFreePort();
-    const agent = new ControlledMailboxAgent();
+    const agent = new ControlledAgent();
     await agent.start(agentPort);
     cleanups.push(async () => agent.stop());
     await writeConfig(tempRoot, {
-      slack: {
-        app_token: "xapp-test",
-        bot_token: "xoxb-test",
-        api_base_url: `http://127.0.0.1:${slackPort}/api`,
-      },
+      im_connections: [testSlackConnection(slackPort)],
       bind: {
         gateway: `127.0.0.1:${gatewayPort}`,
         runtime: `127.0.0.1:${runtimePort}`,
+        control: `127.0.0.1:${adminPort}`,
         agent: `127.0.0.1:${agentPort}`,
       },
     });
@@ -697,19 +708,19 @@ describe.sequential("Gateway mailbox delivery", () => {
     expect(Object.keys(append.body)).toEqual(["content"]);
     expect(append.body.content).toContain("deliver through the fresh application");
     expect(append.sessionId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-    agent.accept(1);
+    append.respond();
     await waitFor(
       () => slack.acknowledgedEnvelopeIds,
       (ids) => ids.includes("env-evt-mailbox-legacy"),
       "legacy Slack acknowledgement after mailbox receipt",
     );
 
-    const current = readGatewaySession(path.join(stateDir, "gateway.sqlite"), "C-LEGACY:900.100");
+    const current = readGatewaySession(path.join(stateDir, "gateway.sqlite"), testSessionKey("C-LEGACY", "900.100"));
     expect(current).toMatchObject({
       id: append.sessionId,
     });
     expect(current?.workspace_path).not.toBe(legacyWorkspace);
-    expect(current?.workspace_path).toBe(path.join(tempRoot, "workspaces", "slack", "C-LEGACY", "900.100"));
+    expect(current?.workspace_path).toBe(testNormalWorkspace(tempRoot, "C-LEGACY", "900.100"));
     expect(agent.creates[0]?.workspace).toBe(current?.workspace_path);
     expect(gatewaySessionIdentityConstraints(stateDir, append.sessionId)).toEqual({
       nullIdRejected: false,
@@ -745,16 +756,14 @@ describe.sequential("Gateway mailbox delivery", () => {
 
     const gatewayPort = await getFreePort();
     const runtimePort = await getFreePort();
+    const adminPort = await getFreePort();
     const agentPort = await getFreePort();
     await writeConfig(tempRoot, {
-      slack: {
-        app_token: "xapp-test",
-        bot_token: "xoxb-test",
-        api_base_url: `http://127.0.0.1:${slackPort}/api`,
-      },
+      im_connections: [testSlackConnection(slackPort)],
       bind: {
         gateway: `127.0.0.1:${gatewayPort}`,
         runtime: `127.0.0.1:${runtimePort}`,
+        control: `127.0.0.1:${adminPort}`,
         agent: `127.0.0.1:${agentPort}`,
       },
     });
@@ -772,6 +781,7 @@ describe.sequential("Gateway mailbox delivery", () => {
             thinking: ["off"],
             default_thinking: "off",
             capabilities: { input: ["text"] },
+            limits: { context_window_tokens: 131_072, max_output_tokens: 8_192 },
             default: true,
           },
         ],
@@ -803,7 +813,7 @@ describe.sequential("Gateway mailbox delivery", () => {
     await slack.sendEvent("evt-mailbox-1", firstSlackEvent);
     await provider.waitForRequest(1);
     await waitFor(
-      () => readInboundStatus(stateDir, "C-MAILBOX:700.100", "700.101"),
+      () => readInboundStatus(stateDir, testSessionKey("C-MAILBOX", "700.100"), "700.101"),
       (status) => status === "delivered",
       "first mailbox receipt",
     );
@@ -814,7 +824,7 @@ describe.sequential("Gateway mailbox delivery", () => {
       text: "<@UBOT> second mailbox input",
     });
     await waitFor(
-      () => readInboundStatus(stateDir, "C-MAILBOX:700.100", "700.102"),
+      () => readInboundStatus(stateDir, testSessionKey("C-MAILBOX", "700.100"), "700.102"),
       (status) => status === "delivered",
       "second mailbox receipt while provider is blocked",
     );
@@ -843,10 +853,10 @@ describe.sequential("Gateway mailbox delivery", () => {
     expect(slack.postedMessages.some((message) => message.text.includes("internal first answer"))).toBe(false);
     expect(slack.postedMessages.some((message) => message.text.includes("internal second answer"))).toBe(false);
 
-    const gatewaySession = readGatewaySession(path.join(stateDir, "gateway.sqlite"), "C-MAILBOX:700.100");
+    const gatewaySession = readGatewaySession(path.join(stateDir, "gateway.sqlite"), testSessionKey("C-MAILBOX", "700.100"));
     const agentMessages = await waitFor(
       async () =>
-        (await fetch(`http://127.0.0.1:${agentPort}/v1/sessions/${gatewaySession?.id}/messages`, {
+        (await fetch(`http://127.0.0.1:${agentPort}/sessions/${gatewaySession?.id}/messages`, {
           headers: { authorization: `Bearer ${agentToken}` },
         }).then((response) => response.json())) as {
           items?: Array<{ type?: string; role?: string; content?: string }>;
@@ -854,9 +864,11 @@ describe.sequential("Gateway mailbox delivery", () => {
       (payload) => payload.items?.some((item) => item.role === "assistant" && item.content === "internal second answer") === true,
       "Agent-owned message history",
     );
-    expect(agentMessages.items?.filter((item) => item.role === "user" && item.content?.includes("second mailbox input"))).toHaveLength(1);
+    expect(agentMessages.items?.filter((item) => item.role === "mailbox" && item.content?.includes("second mailbox input"))).toHaveLength(1);
 
-    const timeline = (await fetch(`http://127.0.0.1:${runtimePort}/internal/realtime/sessions/${encodeURIComponent("C-MAILBOX:700.100")}/timeline?limit=100`).then((response) => response.json())) as { events?: Array<{ type?: string; title?: string }> };
+    const timeline = (await fetch(`http://127.0.0.1:${runtimePort}/internal/realtime/sessions/${encodeURIComponent(testSessionKey("C-MAILBOX", "700.100"))}/timeline?limit=100`).then((response) => response.json())) as {
+      events?: Array<{ type?: string; title?: string }>;
+    };
     expect((timeline.events ?? []).some((event) => event.type === "agent_assistant_message")).toBe(false);
 
     const columns = sessionColumns(stateDir);
@@ -868,6 +880,219 @@ describe.sequential("Gateway mailbox delivery", () => {
     const serializedProjection = JSON.stringify(adminProjection);
     expect(serializedProjection).not.toContain("activeTurn");
     expect(serializedProjection).not.toContain("activation");
+  });
+
+  it("runs two Slack connections with independent normal and proactive routing", { timeout: 45_000 }, async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "zork-gateway-multi-im-"));
+    cleanups.push(async () => removeTempRoot(tempRoot));
+    const normalSlack = new MockSlackServer("U-NORMAL", { botId: "B-NORMAL", appId: "A-NORMAL" });
+    const proactiveSlack = new MockSlackServer("U-PROACTIVE", {
+      botId: "B-PROACTIVE",
+      appId: "A-PROACTIVE",
+    });
+    const [normalPort, proactivePort] = await Promise.all([normalSlack.start(), proactiveSlack.start()]);
+    cleanups.push(async () => normalSlack.stop());
+    cleanups.push(async () => proactiveSlack.stop());
+
+    const [gatewayPort, runtimePort, adminPort, agentPort] = await Promise.all([getFreePort(), getFreePort(), getFreePort(), getFreePort()]);
+    const agent = new ControlledAgent();
+    await agent.start(agentPort);
+    cleanups.push(async () => agent.stop());
+    await writeConfig(tempRoot, {
+      im_connections: [
+        {
+          id: "01J00000000000000000000001",
+          name: "Normal Slack",
+          provider: "slack",
+          enabled: true,
+          mode: "normal",
+          app_token: "xapp-normal",
+          bot_token: "xoxb-normal",
+          api_base_url: `http://127.0.0.1:${normalPort}/api`,
+        },
+        {
+          id: "01J00000000000000000000002",
+          name: "Proactive Slack",
+          provider: "slack",
+          enabled: true,
+          mode: "proactive",
+          app_token: "xapp-proactive",
+          bot_token: "xoxb-proactive",
+          api_base_url: `http://127.0.0.1:${proactivePort}/api`,
+        },
+      ],
+      bind: {
+        gateway: `127.0.0.1:${gatewayPort}`,
+        runtime: `127.0.0.1:${runtimePort}`,
+        control: `127.0.0.1:${adminPort}`,
+        agent: `127.0.0.1:${agentPort}`,
+      },
+    });
+    const gateway = spawnBinary("zork-gateway", {
+      cwd: brokerRoot,
+      args: ["--data", tempRoot, "--fake-agent", "--agent-token", agentToken],
+    });
+    cleanups.push(async () => stopChild(gateway));
+    await waitForReady(`http://127.0.0.1:${runtimePort}/readyz`, "multi IM Gateway readyz");
+    await Promise.all([normalSlack.waitForSocket(), proactiveSlack.waitForSocket()]);
+
+    await normalSlack.sendEvent("same-message", {
+      type: "app_mention",
+      user: "U123",
+      channel: "C-SAME",
+      channel_type: "channel",
+      ts: "100.001",
+      text: "<@U-NORMAL> normal request",
+    });
+    const normalAppend = await agent.waitForAppend(1);
+    expect(normalAppend.body.content).toContain('"connection_id": "01J00000000000000000000001"');
+    normalAppend.respond();
+
+    await proactiveSlack.sendEvent("same-message", {
+      type: "message",
+      user: "U123",
+      channel: "C-SAME",
+      channel_type: "channel",
+      ts: "100.001",
+      text: "proactive observation",
+    });
+    const proactiveAppend = await agent.waitForAppend(2);
+    expect(proactiveAppend.body.content).toContain('"connection_id": "01J00000000000000000000002"');
+    expect(proactiveAppend.sessionId).not.toBe(normalAppend.sessionId);
+    expect(agent.creates).toHaveLength(2);
+    expect(agent.creates.map((create) => String(create.workspace))).toEqual(expect.arrayContaining([expect.stringContaining("01J00000000000000000000001"), expect.stringContaining("01J00000000000000000000002")]));
+    proactiveAppend.respond();
+
+    const normalSessionKey = "01J00000000000000000000001:C-SAME:100.001";
+    const proactiveSessionKey = "01J00000000000000000000002";
+    const normalPost = await fetch(`http://127.0.0.1:${runtimePort}/chat/post-message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionKey: normalSessionKey,
+        conversationId: "C-SAME",
+        rootMessageId: "100.001",
+        text: "normal account reply",
+      }),
+    });
+    expect(normalPost.status).toBe(200);
+    const proactivePost = await fetch(`http://127.0.0.1:${runtimePort}/chat/post-message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionKey: proactiveSessionKey,
+        conversationId: "C-PROACTIVE-OUT",
+        rootMessageId: "500.001",
+        text: "proactive account reply",
+      }),
+    });
+    expect(proactivePost.status).toBe(200);
+    expect(normalSlack.postedMessages.map((message) => message.text)).toContain("normal account reply");
+    expect(normalSlack.postedMessages.map((message) => message.text)).not.toContain("proactive account reply");
+    expect(proactiveSlack.postedMessages.map((message) => message.text)).toContain("proactive account reply");
+    expect(proactiveSlack.postedMessages.map((message) => message.text)).not.toContain("normal account reply");
+
+    const normalHistory = await fetch(
+      `http://127.0.0.1:${runtimePort}/chat/thread-history?${new URLSearchParams({
+        sessionKey: normalSessionKey,
+        conversationId: "C-SAME",
+        rootMessageId: "100.001",
+      })}`,
+    );
+    expect(normalHistory.status).toBe(200);
+    const proactiveHistory = await fetch(
+      `http://127.0.0.1:${runtimePort}/chat/thread-history?${new URLSearchParams({
+        sessionKey: proactiveSessionKey,
+        conversationId: "C-PROACTIVE-OUT",
+        rootMessageId: "500.001",
+      })}`,
+    );
+    expect(proactiveHistory.status).toBe(200);
+    expect(normalSlack.conversationsRepliesCalls).toBe(1);
+    expect(proactiveSlack.conversationsRepliesCalls).toBe(1);
+
+    const normalRaw = await fetch(`http://127.0.0.1:${gatewayPort}/sessions/${encodeURIComponent(normalSessionKey)}/im/raw/auth.test`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "",
+    });
+    expect(normalRaw.status).toBe(200);
+    await expect(normalRaw.json()).resolves.toMatchObject({ ok: true, user_id: "U-NORMAL" });
+    const proactiveRaw = await fetch(`http://127.0.0.1:${gatewayPort}/sessions/${encodeURIComponent(proactiveSessionKey)}/im/raw/auth.test`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "",
+    });
+    expect(proactiveRaw.status).toBe(200);
+    await expect(proactiveRaw.json()).resolves.toMatchObject({
+      ok: true,
+      user_id: "U-PROACTIVE",
+    });
+
+    const normalFileUrl = normalSlack.addDownloadableFile("normal-only", Buffer.from("normal bytes"));
+    const proactiveFileUrl = proactiveSlack.addDownloadableFile("proactive-only", Buffer.from("proactive bytes"));
+    const normalDownload = await fetch(`http://127.0.0.1:${gatewayPort}/sessions/${encodeURIComponent(normalSessionKey)}/im/download?${new URLSearchParams({ url: normalFileUrl })}`);
+    expect(normalDownload.status).toBe(200);
+    expect(await normalDownload.text()).toBe("normal bytes");
+    const proactiveDownload = await fetch(`http://127.0.0.1:${gatewayPort}/sessions/${encodeURIComponent(proactiveSessionKey)}/im/download?${new URLSearchParams({ url: proactiveFileUrl })}`);
+    expect(proactiveDownload.status).toBe(200);
+    expect(await proactiveDownload.text()).toBe("proactive bytes");
+    const crossConnectionDownload = await fetch(`http://127.0.0.1:${gatewayPort}/sessions/${encodeURIComponent(normalSessionKey)}/im/download?${new URLSearchParams({ url: proactiveFileUrl })}`);
+    expect(crossConnectionDownload.status).toBe(400);
+
+    await normalSlack.sendEvent("ambient-normal", {
+      type: "message",
+      user: "U123",
+      channel: "C-IGNORED",
+      channel_type: "channel",
+      ts: "200.001",
+      text: "normal mode must ignore ambient channel messages",
+    });
+    await waitFor(
+      () => normalSlack.acknowledgedEnvelopeIds,
+      (ids) => ids.includes("env-ambient-normal"),
+      "normal ambient acknowledgement",
+    );
+    expect(agent.appends).toHaveLength(2);
+
+    const modeChange = await fetch(`http://127.0.0.1:${adminPort}/admin/api/im/connections/01J00000000000000000000002`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "normal" }),
+    });
+    expect(modeChange.status).toBe(200);
+    await waitFor(
+      () => proactiveSlack.socketConnectionCount,
+      (count) => count >= 2,
+      "changed connection reconnect",
+    );
+    expect(normalSlack.socketConnectionCount).toBe(1);
+
+    await proactiveSlack.sendEvent("proactive-now-normal", {
+      type: "app_mention",
+      user: "U123",
+      channel: "C-NEW-NORMAL",
+      channel_type: "channel",
+      ts: "300.001",
+      text: "<@U-PROACTIVE> this connection is normal now",
+    });
+    const changedModeAppend = await agent.waitForAppend(3);
+    expect(changedModeAppend.body.content).toContain('"connection_id": "01J00000000000000000000002"');
+    expect(changedModeAppend.sessionId).not.toBe(proactiveAppend.sessionId);
+    changedModeAppend.respond();
+
+    await normalSlack.sendEvent("normal-still-running", {
+      type: "app_mention",
+      user: "U123",
+      channel: "C-NORMAL-SECOND",
+      channel_type: "channel",
+      ts: "400.001",
+      text: "<@U-NORMAL> unchanged connection still works",
+    });
+    const unchangedConnectionAppend = await agent.waitForAppend(4);
+    expect(unchangedConnectionAppend.body.content).toContain('"connection_id": "01J00000000000000000000001"');
+    unchangedConnectionAppend.respond();
+    expect(normalSlack.socketConnectionCount).toBe(1);
   });
 });
 
@@ -899,16 +1124,14 @@ function sessionColumns(stateDir: string): string[] {
   }
 }
 
-async function readJsonRequest(request: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.from(chunk));
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
-}
-
 function gatewayTableNames(stateDir: string): string[] {
   const db = new DatabaseSync(path.join(stateDir, "gateway.sqlite"), { readOnly: true });
   try {
-    return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name);
+    return (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
   } finally {
     db.close();
   }
@@ -919,8 +1142,6 @@ function insertBackgroundJob(
   job: {
     id: string;
     sessionKey: string;
-    channelId: string;
-    rootMessageId: string;
     workspacePath: string;
   },
 ): void {
@@ -928,10 +1149,10 @@ function insertBackgroundJob(
   try {
     db.prepare(
       `INSERT INTO background_jobs (
-         id, token, session_key, channel_id, root_thread_ts, kind, shell, cwd, script_path,
+         id, token, session_key, kind, shell, cwd, script_path,
          restart_on_boot, status, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, 'test', 'sh', ?, ?, 0, 'running', ?, ?)`,
-    ).run(job.id, `token-${job.id}`, job.sessionKey, job.channelId, job.rootMessageId, job.workspacePath, path.join(job.workspacePath, `${job.id}.sh`), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+       ) VALUES (?, ?, ?, 'test', 'sh', ?, ?, 0, 'running', ?, ?)`,
+    ).run(job.id, `token-${job.id}`, job.sessionKey, job.workspacePath, path.join(job.workspacePath, `${job.id}.sh`), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
   } finally {
     db.close();
   }
@@ -1034,20 +1255,20 @@ function readOriginBrokerSession(databasePath: string, key: string): { agent_ses
 function gatewaySessionIdentityConstraints(stateDir: string, existingId: string): { nullIdRejected: boolean; duplicateIdRejected: boolean } {
   const db = new DatabaseSync(path.join(stateDir, "gateway.sqlite"));
   const insert = db.prepare(
-    `INSERT INTO sessions (key, id, channel_id, root_thread_ts, workspace_path, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+    `INSERT INTO sessions (key, id, connection_id, platform, channel_id, root_thread_ts, workspace_path, created_at, updated_at)
+     VALUES (?, ?, ?, 'slack', ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
   );
   db.exec("BEGIN");
   try {
     let nullIdRejected = false;
     let duplicateIdRejected = false;
     try {
-      insert.run("C-NULL:1.0", null, "C-NULL", "1.0", path.join(stateDir, "null-id"));
+      insert.run(`${testConnectionId}:C-NULL:1.0`, null, testConnectionId, "C-NULL", "1.0", path.join(stateDir, "null-id"));
     } catch {
       nullIdRejected = true;
     }
     try {
-      insert.run("C-DUPLICATE:2.0", existingId, "C-DUPLICATE", "2.0", path.join(stateDir, "duplicate-id"));
+      insert.run(`${testConnectionId}:C-DUPLICATE:2.0`, existingId, testConnectionId, "C-DUPLICATE", "2.0", path.join(stateDir, "duplicate-id"));
     } catch {
       duplicateIdRejected = true;
     }

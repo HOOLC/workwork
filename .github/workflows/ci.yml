@@ -6,6 +6,10 @@ on:
       - main
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -18,6 +22,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up kache build cache
+        uses: kunobi-ninja/kache-action@v1
+        with:
+          s3-bucket: zork-kache
+          s3-region: auto
+          s3-endpoint: https://17b387559836c2d9941e2bf7dc01aba4.r2.cloudflarestorage.com
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -34,7 +47,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Check formatting
-        run: pnpm format:check
+        run: |
+          pnpm format:check
+          cargo fmt --all -- --check
 
       - name: Lint
         run: pnpm lint
@@ -44,6 +59,12 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+      - name: Run backend tests
+        run: pnpm test:rust
+
+      - name: Run desktop entry contract
+        run: python3 crates/zork-gui/tests/test_gateway_entry.py
 
       - name: Stage release packages
         run: pnpm release:stage

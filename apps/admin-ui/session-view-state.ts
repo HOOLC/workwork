@@ -56,7 +56,7 @@ export function defaultUiState(): UiState {
 
 export function normalizeUiState(value: unknown): UiState {
   const next = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  const adminView = ["sessions", "ops"].includes(String(next.adminView || "")) ? String(next.adminView) : "sessions";
+  const adminView = ["sessions", "connections", "ops"].includes(String(next.adminView || "")) ? String(next.adminView) : "sessions";
   const sessionFilter = sessionFilters.includes(String(next.sessionFilter || "")) ? String(next.sessionFilter) : "all";
   const selectedSessionKey = typeof next.selectedSessionKey === "string" && next.selectedSessionKey ? next.selectedSessionKey : null;
   return { adminView, sessionFilter, selectedSessionKey };

@@ -34,6 +34,10 @@ fn default_models() -> Value {
         "thinking": ["off", "low", "medium", "high"],
         "default_thinking": "high",
         "capabilities": { "input": ["text", "image"] },
+        "limits": {
+            "context_window_tokens": 1_000_000,
+            "max_output_tokens": 128_000
+        },
         "default": true
     }])
 }

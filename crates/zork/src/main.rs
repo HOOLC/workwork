@@ -81,8 +81,8 @@ async fn run_supervisor(argv: Vec<String>) -> Result<()> {
     let admin = zork_config::loopback_base_url(&file.bind.control);
     println!("admin  {admin}");
     println!("data   {}", args.data_root.display());
-    if !zork_config::slack_configured(&file) {
-        println!("setup  open admin and paste Slack app/bot tokens");
+    if !zork_config::has_configured_im_connection(&file) {
+        println!("setup  open Control and add an IM connection");
     }
 
     let pid_path = zork_config::zork_pid_path(&args.data_root);

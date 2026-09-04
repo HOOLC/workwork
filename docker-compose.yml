@@ -28,22 +28,22 @@ services:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - rust-target:/src/target
+      - kache-store:/root/.cache/kache
+    environment:
+      KACHE_S3_ACCESS_KEY: ${KACHE_S3_ACCESS_KEY:-}
+      KACHE_S3_SECRET_KEY: ${KACHE_S3_SECRET_KEY:-}
+      KACHE_S3_BUCKET: ${KACHE_S3_BUCKET:-zork-kache}
+      KACHE_S3_ENDPOINT: ${KACHE_S3_ENDPOINT:-https://17b387559836c2d9941e2bf7dc01aba4.r2.cloudflarestorage.com}
+      KACHE_S3_REGION: ${KACHE_S3_REGION:-auto}
     command:
       - bash
       - -c
       - |
         set -euo pipefail
-        cargo build --release -p zork -p zork-gateway -p zork-agent -p zork-call
-        mkdir -p /src/.data/bin
-        cp /src/target/release/zork /src/.data/bin/zork
-        cp /src/target/release/zork-gateway /src/.data/bin/zork-gateway
-        cp /src/target/release/zork-call /src/.data/bin/zork-call
-        cp /src/target/release/zork-agent /src/.data/bin/zork-agent
-        cp /src/target/release/zork-gh /src/.data/bin/zork-gh
-        chmod +x /src/.data/bin/zork /src/.data/bin/zork-gateway /src/.data/bin/zork-agent /src/.data/bin/zork-call /src/.data/bin/zork-gh
-        echo "wrote /src/.data/bin/zork*"
+        bash /src/scripts/dev/release-build.sh
 
 volumes:
   cargo-registry:
   cargo-git:
   rust-target:
+  kache-store:

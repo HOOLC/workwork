@@ -1,11 +1,11 @@
-import { spawnSync, type ChildProcess } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
-import { brokerRoot, getFreePort, removeTempRoot, spawnBinary, waitForReady, writeConfig } from "./helpers.js";
+import { brokerRoot, getFreePort, removeTempRoot, spawnBinary, stopChild, waitForReady, writeConfig } from "./helpers.js";
 
 const agentToken = "supervisor-agent-token";
 
@@ -19,7 +19,6 @@ describe.sequential("zork update", () => {
   });
 
   it("restarts Gateway and Agent without restarting the supervisor", async () => {
-    buildZorkBins();
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "zork-update-e2e-"));
     cleanups.push(async () => removeTempRoot(tempRoot));
     const dataRoot = path.join(tempRoot, "data");
@@ -40,22 +39,7 @@ describe.sequential("zork update", () => {
     });
     supervisor.stdout?.resume();
     supervisor.stderr?.resume();
-    cleanups.push(async () => {
-      if (supervisor.exitCode != null || supervisor.signalCode != null) {
-        return;
-      }
-      supervisor.kill("SIGTERM");
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          supervisor.kill("SIGKILL");
-          resolve();
-        }, 10_000);
-        supervisor.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-    });
+    cleanups.push(() => stopChild(supervisor));
 
     await Promise.all([
       // One Gateway process serves all three public/control listeners.
@@ -91,13 +75,6 @@ describe.sequential("zork update", () => {
   }, 90_000);
 });
 
-function buildZorkBins(): void {
-  const result = spawnSync("vp", ["run", "build:rust"], { cwd: brokerRoot, encoding: "utf8" });
-  if (result.status !== 0) {
-    throw new Error(`failed to build zork bins:\n${result.stderr || result.stdout}`);
-  }
-}
-
 async function readPids(ports: { readonly gatewayPort: number; readonly runtimePort: number; readonly controlPort: number; readonly agentPort: number }): Promise<{ runtime: number; control: number; agent: number }> {
   const [runtime, control, agent] = await Promise.all([readPid(`http://127.0.0.1:${ports.runtimePort}/readyz`), readPid(`http://127.0.0.1:${ports.controlPort}/readyz`), readPid(`http://127.0.0.1:${ports.agentPort}/readyz`)]);
   return { runtime, control, agent };
@@ -109,7 +86,7 @@ async function readPid(url: string): Promise<number> {
 }
 
 async function expectAgentToken(agentPort: number): Promise<void> {
-  const url = `http://127.0.0.1:${agentPort}/v1/sessions`;
+  const url = `http://127.0.0.1:${agentPort}/sessions`;
   expect((await fetch(url)).status).toBe(401);
   expect((await fetch(url, { headers: { authorization: `Bearer ${agentToken}` } })).status).toBe(200);
 }

@@ -20,6 +20,7 @@ const SETTINGS_URL: &str = "https://cli-chat-proxy.grok.com/v1/settings";
 const MANAGEMENT_API_ROOT: &str = "https://management-api.x.ai/v1";
 const SUBSCRIPTION_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const API_BASE: &str = "https://api.x.ai/v1";
+const GROK_CLI_COMPAT_VERSION: &str = "1.0.5";
 const REFRESH_LEEWAY_MS: i64 = 5 * 60 * 1000;
 const WEEKLY_WINDOW_MINS: i64 = 10_080;
 
@@ -29,6 +30,9 @@ fn grok_headers() -> Value {
     json!({
         "user-agent": "xai-grok-cli",
         "x-xai-token-auth": "xai-grok-cli",
+        "x-grok-client-version": GROK_CLI_COMPAT_VERSION,
+        "x-grok-client-identifier": "grok-shell",
+        "x-grok-client-mode": "headless",
     })
 }
 
@@ -40,6 +44,10 @@ fn default_models() -> Value {
         "thinking": ["low", "medium", "high", "xhigh"],
         "default_thinking": "xhigh",
         "capabilities": { "input": ["text", "image"] },
+        "limits": {
+            "context_window_tokens": 500_000,
+            "max_output_tokens": 8_192
+        },
         "default": true
     }])
 }
@@ -87,6 +95,17 @@ impl AuthProvider for Xai {
         nonempty(auth.get("access"))
             .or_else(|| nonempty(auth.get("key")))
             .context("Missing xAI access token")
+    }
+
+    fn decorate_execution_headers(
+        &self,
+        billing: &str,
+        model: &str,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        if billing == "subscription" {
+            headers.insert("x-grok-model-override".into(), model.to_owned());
+        }
     }
 
     async fn probe(&self, http: &Client, document: &Value) -> Result<QuotaSnapshot> {
@@ -450,6 +469,9 @@ async fn fetch_xai_json(http: &Client, url: &str, bearer: String) -> Result<reqw
         .header("accept", "application/json")
         .header("user-agent", "xai-grok-cli")
         .header("x-xai-token-auth", "xai-grok-cli")
+        .header("x-grok-client-version", GROK_CLI_COMPAT_VERSION)
+        .header("x-grok-client-identifier", "grok-shell")
+        .header("x-grok-client-mode", "headless")
         .timeout(Duration::from_secs(20))
         .send()
         .await
@@ -509,4 +531,28 @@ fn timestamp_ms(value: Option<&Value>) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|value| value.timestamp_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_template_identifies_a_current_grok_cli_and_selected_model() {
+        let template = Xai.template("subscription").unwrap();
+        let headers = template.headers.as_object().unwrap();
+        let selected_model = template.models[0]["id"].as_str().unwrap();
+
+        assert_eq!(headers["x-xai-token-auth"], "xai-grok-cli");
+        assert_eq!(headers["x-grok-client-version"], "1.0.5");
+        assert_eq!(headers["x-grok-client-identifier"], "grok-shell");
+        assert_eq!(headers["x-grok-client-mode"], "headless");
+
+        let mut execution_headers = std::collections::HashMap::from([(
+            "x-grok-model-override".to_owned(),
+            "stale-model".to_owned(),
+        )]);
+        Xai.decorate_execution_headers("subscription", selected_model, &mut execution_headers);
+        assert_eq!(execution_headers["x-grok-model-override"], selected_model);
+    }
 }

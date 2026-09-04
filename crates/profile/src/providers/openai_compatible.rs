@@ -93,8 +93,8 @@ fn configured_snapshot() -> QuotaSnapshot {
             "requiresOpenaiAuth": false
         }),
         rate_limits: json!({
-            "ok": false,
-            "error": "not_reported_by_provider"
+            "ok": true,
+            "reported": false
         }),
         auth: None,
     }
@@ -105,12 +105,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_status_does_not_claim_remote_quota_or_health() {
+    fn configured_status_represents_unreported_quota_without_failure() {
         let snapshot = configured_snapshot();
 
         assert_eq!(snapshot.account["ok"], true);
         assert_eq!(snapshot.account["account"]["type"], "openai-compatible");
-        assert_eq!(snapshot.rate_limits["error"], "not_reported_by_provider");
+        assert_eq!(
+            snapshot.rate_limits,
+            json!({ "ok": true, "reported": false })
+        );
         assert!(snapshot.auth.is_none());
     }
 }

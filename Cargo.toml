@@ -1,8 +1,18 @@
 [workspace]
-members = ["crates/gateway", "crates/agent", "crates/profile", "crates/slack", "crates/zork-call", "crates/zork-config", "crates/zork"]
+members = ["crates/gateway", "crates/agent", "crates/agent-api", "crates/agent-testkit", "crates/profile", "crates/slack", "crates/zork-call", "crates/zork-config", "crates/zork", "crates/zork-gui"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 publish = false
+
+[workspace.dependencies]
+futures-util = { version = "0.3.31", features = ["channel"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+serde = { version = "1.0.228", features = ["alloc", "derive", "rc"] }
+tokio = { version = "1.48.0", features = ["full", "test-util"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+[profile.dev.package.sha2]
+opt-level = 3

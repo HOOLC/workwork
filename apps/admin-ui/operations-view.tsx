@@ -8,11 +8,9 @@ import { LogsPanel, OperationRecords, ServicePanel } from "./operations-status-p
 
 import { AddProfileDialog, ProfilesPanel } from "./profiles-panel.js";
 
-import { SlackSettingsPanel } from "./slack-settings";
-
 import React, { useState } from "react";
 
-export function OperationsView({ status, slackSetup, onSlackChange }: { readonly status: AdminStatus; readonly slackSetup: import("./slack-settings").SlackSetup | null; readonly onSlackChange: (setup: import("./slack-settings").SlackSetup) => void }): React.JSX.Element {
+export function OperationsView({ status }: { readonly status: AdminStatus }): React.JSX.Element {
   const [addProfileOpen, setAddProfileOpen] = useState(false);
   const [githubBindAccount, setGitHubBindAccount] = useState<Record<string, any> | null>(null);
   const [deployStatus, setDeployStatus] = useState<string | null>(null);
@@ -21,9 +19,13 @@ export function OperationsView({ status, slackSetup, onSlackChange }: { readonly
 
   return (
     <div className="ops-page">
-      <div className="view-grid ops-grid">
-        <SlackSettingsPanel setup={slackSetup} onChange={onSlackChange} />
-      </div>
+      <header className="page-heading ops-heading">
+        <div>
+          <div className="eyebrow">Control</div>
+          <h1>设置与运行</h1>
+          <p>管理模型 Profile、部署和 Gateway 运行状态。IM 账号在“IM 接入”中单独管理。</p>
+        </div>
+      </header>
       <div className="view-grid ops-grid">
         <DeployPanel status={status} message={deployStatus} setMessage={setDeployStatus} />
         <OperationRecords status={status} />

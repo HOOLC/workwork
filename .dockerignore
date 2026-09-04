@@ -18,5 +18,3 @@ docs
 *.md
 !README.md
 !LICENSE
-!crates/runtime/prompts/*.md
-!crates/agent/prompts/*.md
